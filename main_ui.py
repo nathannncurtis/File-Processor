@@ -2,90 +2,148 @@ import multiprocessing
 import subprocess
 import os
 import sys
-from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QPushButton, QListWidget, QVBoxLayout, QWidget, QLabel, QInputDialog, QSpacerItem, QSizePolicy, QSystemTrayIcon, QMenu, QAction, qApp, QDialog, QLineEdit, QSpinBox, QDialogButtonBox, QMenuBar, QMessageBox, QDesktopWidget
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+import threading
+import traceback
+from PyQt5.QtWidgets import QApplication, QMainWindow, QFileDialog, QPushButton, QListWidget, QVBoxLayout, QWidget, QLabel, QInputDialog, QSpacerItem, QSizePolicy, QSystemTrayIcon, QMenu, QAction, qApp, QDialog, QLineEdit, QSpinBox, QDialogButtonBox, QMenuBar, QMessageBox, QDesktopWidget, QHBoxLayout, QProgressBar
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
 from PyQt5.QtGui import QFont, QIcon, QCursor
-from job_manager import JobManager
 from time import sleep
 import time
 
+# Try to import psutil for better physical core detection
+try:
+    import psutil
+    HAVE_PSUTIL = True
+except ImportError:
+    HAVE_PSUTIL = False
+    print("psutil not available. Physical core detection will be limited.")
+
+# Defer job_manager import to handle path issues
+JobManager = None
+
+# Set base directory properly for both frozen and non-frozen modes
 BASE_DIR = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
 
+print(f"Base directory: {BASE_DIR}")
+print(f"Config file path: {CONFIG_FILE}")
+
+# Add the base directory to sys.path to ensure module imports work
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+# Now import job_manager
+try:
+    from job_manager import JobManager
+except ImportError:
+    print(f"Failed to import JobManager. Paths: {sys.path}")
+    print(f"Files in directory: {os.listdir(BASE_DIR)}")
+    print(traceback.format_exc())
+    # We'll handle this error in the MainUI class
+
 class JobQueueManager(QThread):
     job_finished_signal = pyqtSignal()
+    status_update_signal = pyqtSignal()
+    core_rebalanced_signal = pyqtSignal()  # New signal for core rebalancing
 
-    def __init__(self, manager, core_cap):
+    def __init__(self, manager):
         super().__init__()
-        self.active_processes = []  # Store references to running processes
         self.manager = manager
-        self.core_cap = core_cap
-        self.active_jobs = []
-        self.job_queue = []
-        
+        self.active_processes = []  # Store references to running processes
+        self.should_stop = False
+        self.last_core_check = time.time()  # Track when we last checked cores
+
     def run(self):
-        while True:
-            if len(self.active_jobs) < self.core_cap and self.job_queue:
-                profile, processor_name, watch_dir, output_dir = self.job_queue.pop(0)
-                self.start_job(profile, processor_name, watch_dir, output_dir)
-            self.sleep(1)  # Polling interval
-
-    def start_job(self, profile, processor_name, watch_dir, output_dir):
-        """Start a job and keep track of the process."""
-        try:
-            # Determine if running as an executable
-            if getattr(sys, 'frozen', False):
-                # Use the .exe if running as a frozen app
-                exe_dir = os.path.dirname(sys.executable)
-                # Force replacement of .py with .exe
-                if processor_name.endswith('.py'):
-                    processor_name = os.path.splitext(processor_name)[0] + '.exe'
-                processor_path = os.path.join(exe_dir, processor_name)
-            else:
-                # Use the .py directly if running as a script
-                processor_path = processor_name
-
-            # Start the processor as a daemon process (no terminal window)
-            process = subprocess.Popen(
-                [processor_path, '--watch-dir', watch_dir, '--output-dir', output_dir],
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-
-            # Store the process so it can be terminated later
-            self.active_processes.append(process)
-
-        except Exception as e:
-            print(f"Failed to start job for {processor_name}: {e}")
-
-    def stop_all_processes(self):
-        """Terminate all active processes."""
-        for process in self.active_processes:
+        """Main thread loop that manages and monitors jobs."""
+        print("JobQueueManager thread started")
+        while not self.should_stop:
             try:
-                process.terminate()  # Send termination signal
-                process.wait()  # Wait for the process to exit
-                print(f"Terminated process: {process.pid}")
+                # Check if any profiles need to be started based on current configuration
+                self.start_active_profiles()
+                
+                # Periodically check if we need to rebalance cores (every 10 seconds)
+                current_time = time.time()
+                if current_time - self.last_core_check > 10:
+                    profiles = self.manager.get_profiles_with_status()
+                    
+                    # Calculate total cores in use
+                    total_allocated_cores = 0
+                    for profile_name, details in profiles.items():
+                        if details['status'] == 'Active':
+                            cores_per_processor = details.get('cores_per_processor', 3)
+                            total_allocated_cores += cores_per_processor * 2
+                    
+                    # If we're over the core cap, trigger a rebalance
+                    if total_allocated_cores > self.manager.get_core_cap():
+                        print(f"Core imbalance detected: {total_allocated_cores} allocated vs {self.manager.get_core_cap()} cap")
+                        self.manager.rebalance_cores()
+                        self.core_rebalanced_signal.emit()
+                    
+                    self.last_core_check = current_time
+                
+                # Emit signal to update UI with current status
+                self.status_update_signal.emit()
             except Exception as e:
-                print(f"Failed to terminate process: {e}")
-        self.active_processes.clear()  # Clear the list of active processes
+                print(f"Error in JobQueueManager run: {e}")
+            
+            # Sleep for a short interval before next cycle
+            time.sleep(1)  # Polling interval
 
-    def queue_job(self, profile, processor_name, watch_dir, output_dir):
-        self.job_queue.append((profile, processor_name, watch_dir, output_dir))
+    def start_active_profiles(self):
+        """Start processors for any active profiles that aren't already running."""
+        try:
+            profiles = self.manager.get_profiles_with_status()
+            for profile_name, details in profiles.items():
+                if details['status'] == "Active" and profile_name not in self.manager.processes:
+                    # Start the processors for this profile
+                    print(f"Queue manager starting processors for {profile_name}")
+                    cores_per_processor = details.get("cores_per_processor", 3)
+                    self.manager.start_processor(profile_name, "jpeg_processor.py", details["JPEG"], details["COMPLETE"], cores_per_processor)
+                    self.manager.start_processor(profile_name, "tiff_processor.py", details["TIFF"], details["COMPLETE"], cores_per_processor)
+        except Exception as e:
+            print(f"Error starting active profiles in JobQueueManager: {e}")
+            print(traceback.format_exc())
+
+    def stop(self):
+        """Safely stop the thread."""
+        self.should_stop = True
+        self.wait()
 
 class CoreCapDialog(QDialog):
-    def __init__(self, current_core_cap, max_cores, parent=None):
+    def __init__(self, current_core_cap, physical_cores, logical_cores, current_max_per_profile, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Set Core Cap")
         
         layout = QVBoxLayout(self)
+        
+        # Add system information with both physical and logical cores
+        system_info = QLabel(f"System has {physical_cores} physical cores ({logical_cores} logical processors)", self)
+        system_info.setStyleSheet("color: black; font-weight: bold;")
+        layout.addWidget(system_info)
 
-        instruction_label = QLabel("Enter number of cores to use:")
+        instruction_label = QLabel("Enter total number of cores to use across all profiles:", self)
         instruction_label.setStyleSheet("color: black;")
         layout.addWidget(instruction_label)
 
         self.spin_box = QSpinBox(self)
-        self.spin_box.setRange(1, max_cores)
-        self.spin_box.setValue(current_core_cap)
+        self.spin_box.setRange(2, physical_cores)
+        self.spin_box.setValue(min(current_core_cap, physical_cores))
         layout.addWidget(self.spin_box)
+
+        max_per_profile_label = QLabel("Maximum cores per profile:", self)
+        max_per_profile_label.setStyleSheet("color: black;")
+        layout.addWidget(max_per_profile_label)
+
+        # Limit max per profile to no more than physical cores
+        self.max_per_profile_spin = QSpinBox(self)
+        self.max_per_profile_spin.setRange(2, min(physical_cores, 12))
+        self.max_per_profile_spin.setValue(min(current_max_per_profile, physical_cores))
+        layout.addWidget(self.max_per_profile_spin)
+        
+        # Add note about per-processor allocation
+        note_label = QLabel("Note: Cores are divided between JPEG and TIFF processors (each gets half)", self)
+        note_label.setStyleSheet("color: black; font-style: italic; font-size: 11px;")
+        layout.addWidget(note_label)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(self.accept)
@@ -94,130 +152,312 @@ class CoreCapDialog(QDialog):
         self.center_on_cursor()
 
     def center_on_cursor(self):
-        screen = QApplication.screenAt(QCursor.pos())
-        screen_geometry = screen.geometry()
-        self.move(screen_geometry.center() - self.rect().center())
+        try:
+            screen = QApplication.screenAt(QCursor.pos())
+            if screen:
+                screen_geometry = screen.geometry()
+                self.move(screen_geometry.center() - self.rect().center())
+        except Exception as e:
+            print(f"Error centering dialog: {e}")
 
-    def get_value(self):
-        return self.spin_box.value()
+    def get_values(self):
+        return {
+            'core_cap': self.spin_box.value(),
+            'max_per_profile': self.max_per_profile_spin.value()
+        }
 
 class ProfileNameDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, max_cores_per_profile, physical_cores=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Add New Job Profile")
+        
+        if physical_cores is None:
+            physical_cores = multiprocessing.cpu_count()
 
         layout = QVBoxLayout(self)
 
-        instruction_label = QLabel("Enter Profile Name:")
+        instruction_label = QLabel("Enter Profile Name:", self)
         instruction_label.setStyleSheet("color: black;")
         layout.addWidget(instruction_label)
 
         self.profile_input = QLineEdit(self)
         layout.addWidget(self.profile_input)
 
+        # Calculate max cores allowed per processor (half of max cores per profile)
+        max_per_processor = max(1, max_cores_per_profile // 2)
+        
+        cores_label = QLabel(f"Cores per processor type (JPEG/TIFF) - Available: {max_per_processor} per processor:", self)
+        cores_label.setStyleSheet("color: black;")
+        layout.addWidget(cores_label)
+
+        self.cores_spin = QSpinBox(self)
+        self.cores_spin.setRange(1, max_per_processor)  # Update range based on available cores
+        default_cores = min(3, max_per_processor)  # Default to 3 or less if fewer cores available
+        self.cores_spin.setValue(default_cores)
+        layout.addWidget(self.cores_spin)
+
+        # Add informational label with physical core information
+        info_label = QLabel(f"This profile will use a total of {default_cores * 2} cores ({default_cores} for JPEG + {default_cores} for TIFF)", self)
+        info_label.setStyleSheet("color: black; font-size: 11px;")
+        layout.addWidget(info_label)
+        
+        # Update info label when cores value changes
+        self.cores_spin.valueChanged.connect(lambda value: info_label.setText(
+            f"This profile will use a total of {value * 2} cores ({value} for JPEG + {value} for TIFF)"
+        ))
+
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
         self.center_on_cursor()
-
     def center_on_cursor(self):
-        screen = QApplication.screenAt(QCursor.pos())
-        screen_geometry = screen.geometry()
-        self.move(screen_geometry.center() - self.rect().center())
+        try:
+            screen = QApplication.screenAt(QCursor.pos())
+            if screen:
+                screen_geometry = screen.geometry()
+                self.move(screen_geometry.center() - self.rect().center())
+        except Exception as e:
+            print(f"Error centering dialog: {e}")
 
-    def get_value(self):
-        return self.profile_input.text()
-
+    def get_values(self):
+        return {
+            'profile_name': self.profile_input.text(),
+            'cores_per_processor': self.cores_spin.value()
+        }
+    
 class MainUI(QMainWindow):
     def __init__(self):
         super().__init__()
+        print("Initializing MainUI")
+        
+        # Check if JobManager was imported successfully
+        if JobManager is None:
+            QMessageBox.critical(self, "Import Error", 
+                             "Failed to import JobManager. Please check the path and file.")
+            qApp.quit()
+            return
+            
         self.setWindowTitle("File Processor")
-        self.setGeometry(100, 100, 600, 400)
-        self.setWindowIcon(QIcon("processor.ico"))
+        self.setGeometry(100, 100, 700, 500)
+        
+        # Safely try to set window icon
+        try:
+            icon_path = os.path.join(BASE_DIR, 'processor.ico')
+            if os.path.exists(icon_path):
+                self.setWindowIcon(QIcon(icon_path))
+                print(f"Icon loaded from {icon_path}")
+            else:
+                print(f"Icon not found at {icon_path}")
+        except Exception as e:
+            print(f"Error setting window icon: {e}")
 
-        self.core_count = multiprocessing.cpu_count()
-        self.core_cap = self.core_count
-        self.manager = JobManager(CONFIG_FILE)
-        self.network_folder = self.manager.config.get('network_folder', '')
+        try:
+            # Get CPU count (logical processors)
+            self.logical_core_count = multiprocessing.cpu_count()
+            # Try to get physical core count
+            self.physical_core_count = self.detect_physical_cores()
+            # Start with physical cores as default, fall back to logical if detection fails
+            self.core_count = self.physical_core_count if self.physical_core_count else self.logical_core_count
+            
+            print(f"Detected {self.logical_core_count} logical processors (threads)")
+            print(f"Detected {self.physical_core_count} physical cores")
+            print(f"Using {self.core_count} cores for constraints")
+            
+            # Initialize job manager
+            self.manager = JobManager(CONFIG_FILE)
+            self.core_cap = min(self.manager.get_core_cap(), self.core_count)  # Ensure it doesn't exceed detected cores
+            self.max_cores_per_profile = min(self.manager.get_max_cores_per_profile(), self.core_count)
+            self.network_folder = self.manager.config.get('network_folder', '')
+        except Exception as e:
+            print(f"Error initializing manager: {e}")
+            print(traceback.format_exc())
+            QMessageBox.critical(self, "Initialization Error", 
+                             f"Failed to initialize job manager: {str(e)}")
+            qApp.quit()
+            return
 
-        self.init_tray()
-        self.init_ui()
-        self.init_menu()
+        # Set up the UI in a try-except block
+        try:
+            self.init_tray()
+            self.init_ui()
+            self.init_menu()
+        except Exception as e:
+            print(f"Error initializing UI: {e}")
+            print(traceback.format_exc())
+            QMessageBox.critical(self, "UI Error", 
+                             f"Failed to initialize UI: {str(e)}")
+            qApp.quit()
+            return
 
-        self.queue_manager = JobQueueManager(self.manager, self.core_cap)
-        self.queue_manager.start()
-        self.center_on_cursor()
+        # Start the queue manager in a try-except block
+        try:
+            # Start the queue manager to monitor and manage jobs
+            self.queue_manager = JobQueueManager(self.manager)
+            self.queue_manager.status_update_signal.connect(self.update_profile_list)
+            self.queue_manager.core_rebalanced_signal.connect(self.handle_core_rebalance)  # Connect the new signal
+            self.queue_manager.start()
+            
+            # Start a timer to periodically update the UI (every 1 second)
+            self.update_timer = QTimer(self)
+            self.update_timer.timeout.connect(self.update_profile_list)
+            self.update_timer.start(1000)  # 1000 milliseconds = 1 second
+            
+            self.center_on_cursor()
+            
+            # Initialize active profiles from config on startup
+            # Use a one-shot timer to ensure UI is fully initialized
+            QTimer.singleShot(1000, self.initialize_active_profiles)
+        except Exception as e:
+            print(f"Error initializing threads: {e}")
+            print(traceback.format_exc())
+            QMessageBox.critical(self, "Thread Error", 
+                            f"Failed to initialize threads: {str(e)}")
+            
+    def handle_core_rebalance(self):
+        """Handle the signal from JobQueueManager when cores are rebalanced."""
+        print("Core rebalance detected, updating UI")
+        self.update_profile_list()
+
+    def detect_physical_cores(self):
+        """Attempt to detect physical cores (not just logical processors)"""
+        try:
+            # Try using psutil if available (more accurate)
+            if HAVE_PSUTIL:
+                physical_cores = psutil.cpu_count(logical=False)
+                print(f"psutil detected {physical_cores} physical cores")
+                return physical_cores
+            
+            # Default if psutil not available - use half the logical cores as an estimate
+            # Most Intel/AMD CPUs use 2 threads per core with hyperthreading
+            estimated_cores = max(1, multiprocessing.cpu_count() // 2)
+            print(f"Estimated {estimated_cores} physical cores (half of logical)")
+            return estimated_cores
+            
+        except Exception as e:
+            print(f"Error detecting physical cores: {e}")
+            # Conservative default - use half the logical processors or at least 2
+            return max(2, multiprocessing.cpu_count() // 2)
+
+    def initialize_active_profiles(self):
+        """Start profiles marked as Active in the config file, after UI is initialized."""
+        try:
+            print("Initializing active profiles from config file")
+            # Print all profiles and their status
+            profiles = self.manager.get_profiles_with_status()
+            for profile_name, details in profiles.items():
+                print(f"Profile: {profile_name}, Status: {details.get('status', 'Unknown')}")
+                
+            # Start all active profiles
+            threading.Thread(target=self.start_all_active_profiles).start()
+        except Exception as e:
+            print(f"Error initializing active profiles: {e}")
+            print(traceback.format_exc())
+
+    def start_all_active_profiles(self):
+        """Called in a thread to start all active profiles"""
+        try:
+            print("Starting all active profiles")
+            self.manager.start_all_profiles()
+            print("All active profiles should now be started")
+        except Exception as e:
+            print(f"Error in start_all_active_profiles: {e}")
+            print(traceback.format_exc())
 
     def init_tray(self):
-        icon_path = os.path.join(BASE_DIR, "processor.ico")
-        self.tray_icon = QSystemTrayIcon(QIcon(icon_path), self)
-        self.tray_icon.setToolTip("File Processor App")
+        print("Initializing system tray")
+        try:
+            icon_path = os.path.join(BASE_DIR, "processor.ico")
+            if os.path.exists(icon_path):
+                self.tray_icon = QSystemTrayIcon(QIcon(icon_path), self)
+            else:
+                print(f"Warning: Icon file not found at {icon_path}")
+                # Create a default tray icon
+                self.tray_icon = QSystemTrayIcon(self)
+                
+            self.tray_icon.setToolTip("File Processor App")
 
-        self.tray_menu = QMenu(self)
-        show_action = QAction("Show", self)
-        quit_action = QAction("Quit", self)
-        self.update_profile_status_menu()
+            self.tray_menu = QMenu(self)
+            self.update_profile_status_menu()
 
-        show_action.triggered.connect(self.show)
-        quit_action.triggered.connect(self.confirm_quit)
-
-        self.tray_menu.addAction(show_action)
-        self.tray_menu.addAction(quit_action)
-
-        self.tray_icon.setContextMenu(self.tray_menu)
-        self.tray_icon.show()
+            self.tray_icon.setContextMenu(self.tray_menu)
+            self.tray_icon.show()
+        except Exception as e:
+            print(f"Error in init_tray: {e}")
+            print(traceback.format_exc())
+            raise
 
     def update_profile_status_menu(self):
-        """Update the system tray menu to show profile names and their statuses."""
-        self.tray_menu.clear()
+        try:
+            self.tray_menu.clear()
 
-        profiles_with_status = self.manager.get_profiles_with_status()
-        for profile, details in profiles_with_status.items():
-            status = details['status']
-            profile_action = QAction(f"{profile} - {status}", self)
-            self.tray_menu.addAction(profile_action)
+            profiles_with_status = self.manager.get_profiles_with_status()
+            for profile, details in profiles_with_status.items():
+                display_status = details.get('display_status', details['status'])
+                cores_per_processor = details.get('cores_per_processor', 3)
+                total_cores = cores_per_processor * 2  # JPEG + TIFF
+                
+                # Include core allocation in the menu item text
+                profile_action = QAction(f"{profile} - {display_status} - {total_cores} cores", self)
+                self.tray_menu.addAction(profile_action)
 
-        show_action = QAction("Show", self)
-        quit_action = QAction("Quit", self)
-        show_action.triggered.connect(self.show)
-        quit_action.triggered.connect(self.confirm_quit)
-        self.tray_menu.addSeparator()
-        self.tray_menu.addAction(show_action)
-        self.tray_menu.addAction(quit_action)
-
+            show_action = QAction("Show", self)
+            quit_action = QAction("Quit", self)
+            show_action.triggered.connect(self.show)
+            quit_action.triggered.connect(self.confirm_quit)
+            self.tray_menu.addSeparator()
+            self.tray_menu.addAction(show_action)
+            self.tray_menu.addAction(quit_action)
+        except Exception as e:
+            print(f"Error updating profile status menu: {e}")
+            print(traceback.format_exc())
     def init_ui(self):
-        icon_path = os.path.join(BASE_DIR, 'processor.ico')
-        self.setWindowIcon(QIcon(icon_path))
-
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #2e2e2e;
-            }
-            QLabel {
-                color: #ffffff;
-                font-size: 14px;
-            }
-            QPushButton {
-                background-color: #4a90e2;
-                color: white;
-                font-size: 14px;
-                padding: 8px;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #357ABD;
-            }
-            QListWidget {
-                background-color: #3e3e3e;
-                color: white;
-                padding: 8px;
-                font-size: 13px;
-                border: 1px solid #4a90e2;
-                border-radius: 4px;
-            }
-        """)
+        print("Initializing UI")
+        
+        # Safely set stylesheet
+        try:
+            self.setStyleSheet("""
+                QMainWindow {
+                    background-color: #2e2e2e;
+                }
+                QLabel {
+                    color: #ffffff;
+                    font-size: 14px;
+                }
+                QPushButton {
+                    background-color: #4a90e2;
+                    color: white;
+                    font-size: 14px;
+                    padding: 8px;
+                    border: none;
+                    border-radius: 4px;
+                }
+                QPushButton:hover {
+                    background-color: #357ABD;
+                }
+                QListWidget {
+                    background-color: #3e3e3e;
+                    color: white;
+                    padding: 8px;
+                    font-size: 13px;
+                    border: 1px solid #4a90e2;
+                    border-radius: 4px;
+                }
+                QPushButton#start_all {
+                    background-color: #4CAF50;
+                }
+                QPushButton#start_all:hover {
+                    background-color: #45a049;
+                }
+                QPushButton#stop_all {
+                    background-color: #f44336;
+                }
+                QPushButton#stop_all:hover {
+                    background-color: #d32f2f;
+                }
+            """)
+        except Exception as e:
+            print(f"Error setting stylesheet: {e}")
 
         layout = QVBoxLayout()
 
@@ -231,153 +471,831 @@ class MainUI(QMainWindow):
 
         set_folder_btn = QPushButton("Set Network Folder", self)
         layout.addWidget(set_folder_btn)
-        set_folder_btn.clicked.connect(self.set_network_folder)
+        set_folder_btn.clicked.connect(lambda: self.set_network_folder())  # Use lambda for connection
 
         layout.addSpacerItem(QSpacerItem(0, 20, QSizePolicy.Minimum, QSizePolicy.Fixed))
+
+        # Add Start All and Stop All buttons in a horizontal layout
+        start_stop_layout = QHBoxLayout()
+        
+        start_all_btn = QPushButton("Start All Profiles", self)
+        start_all_btn.setObjectName("start_all")
+        start_all_btn.clicked.connect(lambda: self.start_all_profiles())  # Use lambda for connection
+        start_stop_layout.addWidget(start_all_btn)
+        
+        stop_all_btn = QPushButton("Stop All Profiles", self)
+        stop_all_btn.setObjectName("stop_all")
+        stop_all_btn.clicked.connect(lambda: self.stop_all_profiles())  # Use lambda for connection
+        start_stop_layout.addWidget(stop_all_btn)
+        
+        layout.addLayout(start_stop_layout)
 
         job_profile_label = QLabel("Job Profiles:", self)
         job_profile_label.setFont(folder_label_font)
         layout.addWidget(job_profile_label)
 
         self.job_list = QListWidget(self)
-        self.load_profiles()
+        self.job_list.setSelectionMode(QListWidget.SingleSelection)  # Ensure items can be selected
+        
+        # Enable right-click context menu
+        self.job_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.job_list.customContextMenuRequested.connect(self.show_profile_context_menu)
+        
         layout.addWidget(self.job_list)
 
+        # Add and remove job profile buttons
+        profile_btn_layout = QHBoxLayout()
+        
         add_job_btn = QPushButton("Add Job Profile", self)
-        layout.addWidget(add_job_btn)
-        add_job_btn.clicked.connect(self.add_job)
-
+        add_job_btn.clicked.connect(lambda: self.add_job())  # Use lambda for connection
+        profile_btn_layout.addWidget(add_job_btn)
+        
         remove_job_btn = QPushButton("Remove Job Profile", self)
-        layout.addWidget(remove_job_btn)
+        # Use lambda to ensure proper connection
         remove_job_btn.clicked.connect(self.remove_job)
+        profile_btn_layout.addWidget(remove_job_btn)
+        
+        layout.addLayout(profile_btn_layout)
 
-        self.core_cap_btn = QPushButton(f"Set Core Cap (Currently: {self.core_cap})", self)
-        layout.addWidget(self.core_cap_btn)
-        self.core_cap_btn.clicked.connect(self.set_core_cap)
+        # Core controls
+        core_layout = QHBoxLayout()
+        
+        self.core_cap_btn = QPushButton(f"Set Core Limits (Total: {self.core_cap}, Max/Profile: {self.max_cores_per_profile}, Physical Cores: {self.core_count})", self)
+        self.core_cap_btn.clicked.connect(lambda: self.set_core_cap())  # Use lambda for connection
+        core_layout.addWidget(self.core_cap_btn)
+        
+        layout.addLayout(core_layout)
 
         layout.addSpacerItem(QSpacerItem(0, 20, QSizePolicy.Minimum, QSizePolicy.Fixed))
 
-        toggle_status_btn = QPushButton("Pause/Unpause Job", self)
-        layout.addWidget(toggle_status_btn)
-        toggle_status_btn.clicked.connect(self.toggle_job_status)
+        # Single job toggle button with disabled state initially
+        self.toggle_status_btn = QPushButton("Pause/Unpause Selected Job", self)
+        self.toggle_status_btn.setEnabled(False)  # Disabled until a profile is selected
+        # Use lambda to ensure proper connection
+        self.toggle_status_btn.clicked.connect(self.toggle_job_status)  # Remove lambda here
+        layout.addWidget(self.toggle_status_btn)
 
+        # Set the widget BEFORE connecting the itemSelectionChanged signal
         widget = QWidget()
         widget.setLayout(layout)
         self.setCentralWidget(widget)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(10)
+        
+        # Initialize toggle_status_btn BEFORE loading profiles
+        # NOW connect the itemSelectionChanged signal after toggle_status_btn is created
+        self.job_list.itemSelectionChanged.connect(self.update_toggle_button_state)
+        
+        # Now load profiles after all UI elements are created
+        self.load_profiles()
+
+    def show_profile_context_menu(self, position):
+        """Show a context menu when right-clicking on a profile in the list."""
+        # Get the item at the position
+        item = self.job_list.itemAt(position)
+        if not item:
+            return  # No item at this position
+            
+        # Select the item that was right-clicked
+        item.setSelected(True)
+            
+        # Extract profile name from the list item text
+        profile_text = item.text()
+        profile_name = profile_text.split(" - ")[0]
+        status = profile_text.split(" - ")[1].lower()
+        
+        # Create context menu
+        context_menu = QMenu(self)
+        
+        # Add actions based on current status
+        if status == "active":
+            pause_action = QAction("Pause Profile", self)
+            pause_action.triggered.connect(lambda: self.direct_pause_profile(profile_name))
+            context_menu.addAction(pause_action)
+        else:
+            start_action = QAction("Start Profile", self)
+            start_action.triggered.connect(lambda: self.direct_start_profile(profile_name))
+            context_menu.addAction(start_action)
+            
+        # Add divider
+        context_menu.addSeparator()
+        
+        # Add remove action
+        remove_action = QAction("Remove Profile", self)
+        remove_action.triggered.connect(lambda: self.remove_specific_profile(profile_name))
+        context_menu.addAction(remove_action)
+        
+        # Show the context menu at the global position
+        context_menu.exec_(self.job_list.mapToGlobal(position))
+        
+        # Update the toggle button state after action
+        self.update_toggle_button_state()
+
+    def update_toggle_button_state(self):
+        """Enable or disable the toggle button based on whether a profile is selected."""
+        selected_items = self.job_list.selectedItems()
+        self.toggle_status_btn.setEnabled(len(selected_items) > 0)
+        
+        # Update button text based on selected profile status if any
+        if selected_items:
+            profile_text = selected_items[0].text()
+            status = profile_text.split(" - ")[1].lower()
+            
+            if status == "active":
+                self.toggle_status_btn.setText("Pause Selected Job")
+            else:
+                self.toggle_status_btn.setText("Start Selected Job")
+        else:
+            self.toggle_status_btn.setText("Pause/Unpause Selected Job")
+
+    def direct_pause_profile(self, profile_name):
+        """Directly pause a profile without using threads (for right-click menu)"""
+        try:
+            print(f"Direct pause profile: {profile_name}")
+            self.manager.pause_profile(profile_name)
+            self.update_profile_list()
+        except Exception as e:
+            print(f"Error in direct_pause_profile: {e}")
+            print(traceback.format_exc())
+            QMessageBox.critical(self, "Error", f"Failed to pause profile: {str(e)}")
+
+    def direct_start_profile(self, profile_name):
+        """Directly start a profile without using threads (for right-click menu)"""
+        try:
+            print(f"Direct start profile: {profile_name}")
+            self.manager.unpause_profile(profile_name)
+            self.update_profile_list()
+        except Exception as e:
+            print(f"Error in direct_start_profile: {e}")
+            print(traceback.format_exc())
+            QMessageBox.critical(self, "Error", f"Failed to start profile: {str(e)}")
+
+    def pause_profile(self, profile_name):
+        """Pause a specific profile."""
+        try:
+            print(f"Pausing profile: {profile_name}")
+            self.manager.pause_profile(profile_name)
+            self.update_profile_list()
+        except Exception as e:
+            print(f"Error pausing profile {profile_name}: {e}")
+            print(traceback.format_exc())
+            QMessageBox.critical(self, "Error", f"Failed to pause profile: {str(e)}")
+
+    def start_profile(self, profile_name):
+        """Start a specific profile."""
+        try:
+            print(f"Starting profile: {profile_name}")
+            self.manager.unpause_profile(profile_name)
+            self.update_profile_list()
+        except Exception as e:
+            print(f"Error starting profile {profile_name}: {e}")
+            print(traceback.format_exc())
+            QMessageBox.critical(self, "Error", f"Failed to start profile: {str(e)}")
+
+    def remove_specific_profile(self, profile_name):
+        """Remove a specific profile."""
+        try:
+            # Show confirmation dialog
+            reply_box = QMessageBox(self)
+            reply_box.setWindowTitle("Confirm Removal")
+            reply_box.setText(f"Are you sure you want to remove the profile '{profile_name}'?")
+            reply_box.setStyleSheet("QLabel { color: black; }")
+            reply_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            self.center_on_cursor(reply_box)
+            reply = reply_box.exec_()
+            
+            if reply == QMessageBox.Yes:
+                # Make sure to stop the profile before removing it
+                try:
+                    if profile_name in self.manager.processes:
+                        print(f"Stopping profile {profile_name} before removal")
+                        self.manager.stop_processor(profile_name)
+                except Exception as stop_error:
+                    print(f"Error stopping profile before removal: {stop_error}")
+                
+                # Now attempt to remove the profile
+                success = False
+                try:
+                    print(f"Removing profile {profile_name}")
+                    self.manager.remove_profile(profile_name)
+                    success = True
+                    print(f"Successfully removed profile {profile_name}")
+                except Exception as remove_error:
+                    print(f"Error during profile removal: {remove_error}")
+                    print(traceback.format_exc())
+                    QMessageBox.critical(self, "Error", f"Failed to remove profile: {str(remove_error)}")
+                
+                # Update UI
+                if success:
+                    self.load_profiles()
+                    self.update_profile_status_menu()
+        except Exception as e:
+            print(f"Error removing profile {profile_name}: {e}")
+            print(traceback.format_exc())
+            QMessageBox.critical(self, "Error", f"Failed to remove profile: {str(e)}")
 
     def init_menu(self):
         """Initialize the file menu with a quit option."""
-        menubar = self.menuBar()
-        file_menu = menubar.addMenu('File')
+        try:
+            menubar = self.menuBar()
+            file_menu = menubar.addMenu('File')
+            
+            # Add core count override option
+            core_count_action = QAction("Set Physical Core Count", self)
+            core_count_action.triggered.connect(self.set_physical_core_count)
+            file_menu.addAction(core_count_action)
+            
+            # Add separator
+            file_menu.addSeparator()
 
-        quit_action = QAction("Quit", self)
-        quit_action.triggered.connect(self.confirm_quit)
-        file_menu.addAction(quit_action)
+            quit_action = QAction("Quit", self)
+            quit_action.triggered.connect(self.confirm_quit)
+            file_menu.addAction(quit_action)
+        except Exception as e:
+            print(f"Error initializing menu: {e}")
+            print(traceback.format_exc())
+
+    def set_physical_core_count(self):
+        """Allow manual override of the physical core count"""
+        try:
+            current_count = self.core_count
+            detected_count = self.logical_core_count
+            
+            # Create a simple dialog
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Set Physical Core Count")
+            
+            layout = QVBoxLayout(dialog)
+            
+            # Add info label
+            info_label = QLabel(f"Detected {detected_count} logical processors (with hyperthreading)", dialog)
+            info_label.setStyleSheet("color: black;")
+            layout.addWidget(info_label)
+            
+            # Add instruction
+            instruction = QLabel("Enter the actual number of physical cores:", dialog)
+            instruction.setStyleSheet("color: black;")
+            layout.addWidget(instruction)
+            
+            # Add spinner for core count
+            core_spinner = QSpinBox(dialog)
+            core_spinner.setRange(1, detected_count)
+            core_spinner.setValue(current_count)
+            layout.addWidget(core_spinner)
+            
+            # Add note about physical vs logical cores
+            note = QLabel("Note: Modern CPUs may show 2x logical processors with hyperthreading enabled", dialog)
+            note.setStyleSheet("color: black; font-style: italic; font-size: 11px;")
+            layout.addWidget(note)
+            
+            # Add buttons
+            button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            button_box.accepted.connect(dialog.accept)
+            button_box.rejected.connect(dialog.reject)
+            layout.addWidget(button_box)
+            
+            # Show dialog
+            if dialog.exec_():
+                new_count = core_spinner.value()
+                if new_count != self.core_count:
+                    self.core_count = new_count
+                    print(f"Physical core count manually set to {new_count}")
+                    
+                    # Update core cap if it exceeds the new count
+                    if self.core_cap > new_count:
+                        self.core_cap = new_count
+                        self.manager.update_core_cap(new_count)
+                    
+                    # Update max cores per profile if it exceeds the new count
+                    if self.max_cores_per_profile > new_count:
+                        self.max_cores_per_profile = new_count
+                        self.manager.update_max_cores_per_profile(new_count)
+                    
+                    # Update UI
+                    self.update_core_cap_button()
+                    
+                    # Show confirmation
+                    QMessageBox.information(self, "Core Count Updated", 
+                                        f"Physical core count set to {new_count}. Core limits updated accordingly.")
+            
+        except Exception as e:
+            print(f"Error setting physical core count: {e}")
+            print(traceback.format_exc())
+            QMessageBox.critical(self, "Error", f"Failed to set physical core count: {str(e)}")
 
     def confirm_quit(self):
         """Show a confirmation dialog before quitting and stop all background processes if confirmed."""
-        reply_box = QMessageBox(self)
-        reply_box.setWindowTitle("Quit Confirmation")
-        reply_box.setText("Are you sure you want to quit?")
-        reply_box.setStyleSheet("QLabel { color: black; }") 
-        reply_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        self.center_on_cursor(reply_box)
-        reply = reply_box.exec_()
+        try:
+            reply_box = QMessageBox(self)
+            reply_box.setWindowTitle("Quit Confirmation")
+            reply_box.setText("Are you sure you want to quit?")
+            reply_box.setStyleSheet("QLabel { color: black; }") 
+            reply_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            self.center_on_cursor(reply_box)
+            reply = reply_box.exec_()
 
-        if reply == QMessageBox.Yes:
-            # Stop all background processes before quitting
-            self.queue_manager.stop_all_processes()
+            if reply == QMessageBox.Yes:
+                # Stop all background processes before quitting
+                self.manager.stop_all_profiles()
+                self.queue_manager.stop()
+                qApp.quit()
+        except Exception as e:
+            print(f"Error in confirm_quit: {e}")
+            print(traceback.format_exc())
+            # Force quit if the normal path fails
             qApp.quit()
 
     def center_on_cursor(self, window=None):
         """Center the given window or the main window on the monitor where the cursor is."""
-        if window is None:
-            window = self
-        screen = QApplication.screenAt(QCursor.pos())
-        screen_geometry = screen.geometry()
-        window.move(screen_geometry.center() - window.rect().center())
+        try:
+            if window is None:
+                window = self
+            screen = QApplication.screenAt(QCursor.pos())
+            if screen:  # Check if screen is not None
+                screen_geometry = screen.geometry()
+                window.move(screen_geometry.center() - window.rect().center())
+        except Exception as e:
+            print(f"Error centering window: {e}")
 
     def closeEvent(self, event):
         """Override close event to minimize to tray."""
         event.ignore()
         self.hide()  # Explicitly hide the window
-        self.tray_icon.showMessage(
-            "File Processor App",
-            "Application minimized to tray. Right-click the tray icon for options.",
-            QSystemTrayIcon.Information,
-            2000
-        )
+        try:
+            self.tray_icon.showMessage(
+                "File Processor App",
+                "Application minimized to tray. Right-click the tray icon for options.",
+                QSystemTrayIcon.Information,
+                2000
+            )
+        except Exception as e:
+            print(f"Error showing tray message: {e}")
 
     def set_network_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Network Folder")
-        if folder:
-            self.network_folder = folder
-            self.folder_label.setText(f"Network Folder: {self.network_folder}")
-            self.manager.update_network_folder(folder)
-            self.load_profiles()
-            self.update_profile_status_menu()
+        try:
+            folder = QFileDialog.getExistingDirectory(self, "Select Network Folder")
+            if folder:
+                self.network_folder = folder
+                self.folder_label.setText(f"Network Folder: {self.network_folder}")
+                self.manager.update_network_folder(folder)
+                self.load_profiles()
+                self.update_profile_status_menu()
+        except Exception as e:
+            print(f"Error setting network folder: {e}")
+            print(traceback.format_exc())
+            QMessageBox.critical(self, "Error", f"Failed to set network folder: {str(e)}")
 
     def load_profiles(self):
-        self.job_list.clear()
-        for profile, details in self.manager.get_profiles_with_status().items():
-            status = details['status']
-            self.job_list.addItem(f"{profile} - {status}")
-        self.update_profile_status_menu()
+        try:
+            # Save current selection if any
+            current_selection = None
+            current_row = -1
+            if self.job_list.selectedItems():
+                current_item = self.job_list.currentItem()
+                if current_item:
+                    current_selection = current_item.text().split(" - ")[0]
+                    current_row = self.job_list.row(current_item)
+                    
+            self.job_list.clear()
+            
+            # Get latest profile information
+            profiles = self.manager.get_profiles_with_status()
+            
+            # Calculate total allocated cores for display
+            total_allocated_cores = 0
+            
+            for profile, details in profiles.items():
+                # Use display_status if available, otherwise fall back to status
+                display_status = details.get('display_status', details['status'])
+                cores_per_processor = details.get('cores_per_processor', 3)
+                total_profile_cores = cores_per_processor * 2  # Total cores (JPEG + TIFF)
+                
+                # Update running total of allocated cores
+                total_allocated_cores += total_profile_cores
+                
+                # Display status and core allocation
+                item_text = f"{profile} - {display_status} - {total_profile_cores} cores"
+                
+                self.job_list.addItem(item_text)
+            
+            # Restore selection if possible
+            if current_selection:
+                for i in range(self.job_list.count()):
+                    item = self.job_list.item(i)
+                    if item and item.text().split(" - ")[0] == current_selection:
+                        self.job_list.setCurrentRow(i)
+                        break
+                # If profile not found but there are items, try to select the same row or last item
+                if not self.job_list.selectedItems() and self.job_list.count() > 0:
+                    if current_row >= 0 and current_row < self.job_list.count():
+                        self.job_list.setCurrentRow(current_row)
+                    else:
+                        self.job_list.setCurrentRow(self.job_list.count() - 1)
+            
+            # Update the status menu in the system tray
+            self.update_profile_status_menu()
+            
+            # Update toggle button state
+            self.update_toggle_button_state()
+            
+            # Update core cap display - show total allocated vs available
+            self.update_core_cap_button(total_allocated_cores)
+        except Exception as e:
+            print(f"Error loading profiles: {e}")
+            print(traceback.format_exc())
+
+    def update_profile_list(self):
+        """Update the profile list in the UI (called periodically)."""
+        try:
+            # Save current selection if any
+            current_selection = None
+            current_row = -1
+            if self.job_list.selectedItems():
+                current_item = self.job_list.currentItem()
+                if current_item:
+                    current_selection = current_item.text().split(" - ")[0]
+                    current_row = self.job_list.row(current_item)
+            
+            # Ensure manager processes reflect reality
+            profiles = self.manager.get_profiles_with_status()
+            
+            # Verify any profiles in transitioning states that might be stuck
+            for profile_name, details in profiles.items():
+                display_status = details.get('display_status', '')
+                status = details.get('status', '')
+                
+                if display_status in ['Pausing...', 'Activating...']:
+                    # Check if it's been stuck for too long
+                    if profile_name in self.manager.transitioning_profiles:
+                        # Reset to non-transitioning state if needed
+                        self.manager.transitioning_profiles.discard(profile_name)
+                        
+            # Reload the profiles in the UI
+            self.load_profiles()
+            
+            # Also update system tray menu to reflect core allocation changes
+            self.update_profile_status_menu()
+            
+            # Try to restore the selection if possible
+            if current_selection:
+                for i in range(self.job_list.count()):
+                    item = self.job_list.item(i)
+                    if item and item.text().split(" - ")[0] == current_selection:
+                        self.job_list.setCurrentRow(i)
+                        break
+                # If profile not found but there are items, try to select the same row or last item
+                if not self.job_list.selectedItems() and self.job_list.count() > 0:
+                    if current_row >= 0 and current_row < self.job_list.count():
+                        self.job_list.setCurrentRow(current_row)
+                    else:
+                        self.job_list.setCurrentRow(self.job_list.count() - 1)
+        except Exception as e:
+            print(f"Error updating profile list: {e}")
+            print(traceback.format_exc())
 
     def add_job(self):
-        dialog = ProfileNameDialog(self)
-        if dialog.exec_():
-            profile_name = dialog.get_value()
-            if profile_name:
-                self.manager.add_profile(profile_name)
-
-                # Determine if we're running as an executable
-                if getattr(sys, 'frozen', False):
-                    exe_dir = os.path.dirname(sys.executable)
-                    jpeg_processor_exe = os.path.join(exe_dir, "jpeg_processor.exe")
-                    tiff_processor_exe = os.path.join(exe_dir, "tiff_processor.exe")
-                else:
-                    jpeg_processor_exe = "jpeg_processor.py"
-                    tiff_processor_exe = "tiff_processor.py"
-
-                # Queue the jobs using the appropriate executable or script
-                self.queue_manager.queue_job(profile_name, jpeg_processor_exe, self.manager.config['profiles'][profile_name]['JPEG'], self.manager.config['profiles'][profile_name]['COMPLETE'])
-                self.queue_manager.queue_job(profile_name, tiff_processor_exe, self.manager.config['profiles'][profile_name]['TIFF'], self.manager.config['profiles'][profile_name]['COMPLETE'])
+        try:
+            # Get all current profiles to calculate available cores
+            profiles = self.manager.get_profiles_with_status()
+            
+            # Calculate total cores already allocated
+            total_allocated_cores = 0
+            for profile_name, details in profiles.items():
+                cores_per_processor = details.get('cores_per_processor', 3)
+                total_allocated_cores += cores_per_processor * 2  # Total is JPEG + TIFF
+            
+            # Calculate available cores (respect the core cap)
+            available_cores = max(2, self.core_cap - total_allocated_cores)
+            
+            # Calculate maximum cores allowed per profile based on constraints
+            max_allowed_per_profile = min(
+                self.max_cores_per_profile,  # User-defined max per profile
+                self.core_count,             # Physical constraint
+                available_cores              # What's left from core cap
+            )
+            
+            # Default cores per processor (half of available, minimum 1)
+            default_cores_per_processor = max(1, min(3, max_allowed_per_profile // 2))
+            
+            # Pass both max_cores_per_profile and physical_cores
+            dialog = ProfileNameDialog(max_allowed_per_profile, self.core_count, self)
+            
+            # Set the default value in the spinner to a reasonable value
+            dialog.cores_spin.setValue(default_cores_per_processor)
+            
+            if dialog.exec_():
+                values = dialog.get_values()
+                profile_name = values['profile_name']
+                cores_per_processor = values['cores_per_processor']
                 
-                self.load_profiles()
+                if profile_name:
+                    print(f"Adding job profile: {profile_name} with {cores_per_processor} cores per processor")
+                    # Add the profile with specified cores per processor
+                    new_profile = self.manager.add_profile(profile_name)
+                    
+                    # Set the cores_per_processor attribute - in the profile settings
+                    # This will be used to calculate the total cores for the profile (2 * cores_per_processor)
+                    self.manager.update_cores_per_processor(profile_name, cores_per_processor)
+                    
+                    # After adding, explicitly call rebalance in the manager
+                    self.manager.rebalance_cores()
+                    
+                    # Update UI
+                    self.update_profile_list()
+                    print(f"Profile {profile_name} added successfully")
+        except Exception as e:
+            print(f"Error adding job: {e}")
+            print(traceback.format_exc())
+            QMessageBox.critical(self, "Error", f"Failed to add job: {str(e)}")
 
+    def rebalance_cores_if_needed(self):
+        """Ensure core allocations are within the global cap by adjusting if needed."""
+        try:
+            profiles = self.manager.get_profiles_with_status()
+            
+            # Calculate total cores allocated
+            total_allocated_cores = 0
+            for profile_name, details in profiles.items():
+                cores_per_processor = details.get('cores_per_processor', 3)
+                total_allocated_cores += cores_per_processor * 2  # Total is JPEG + TIFF
+            
+            # If over the cap, adjust profiles
+            if total_allocated_cores > self.core_cap:
+                print(f"Need to rebalance cores: allocated {total_allocated_cores}, cap {self.core_cap}")
+                
+                # Let the JobManager handle the actual rebalancing
+                self.manager.rebalance_cores()
+                
+                # Update UI to reflect changes
+                self.update_profile_list()
+                
+                # Show notification
+                QMessageBox.information(self, "Cores Rebalanced", 
+                    f"Core allocations were adjusted to fit within the total cap of {self.core_cap} cores.")
+        except Exception as e:
+            print(f"Error rebalancing cores: {e}")
+            print(traceback.format_exc())
+    
     def remove_job(self):
-        selected_item = self.job_list.currentItem()
-        if selected_item:
-            profile_name = selected_item.text().split(" - ")[0]
-            self.manager.remove_profile(profile_name)
-            self.load_profiles()
+        """Remove the currently selected job profile."""
+        try:
+            # Get the currently selected item
+            selected_item = self.job_list.currentItem()
+            if not selected_item:
+                print("No profile selected for removal")
+                return
+                
+            # Extract profile name - handle the format "profile_name - status - cores cores"
+            profile_text = selected_item.text()
+            profile_name = profile_text.split(" - ")[0]
+            
+            print(f"Remove job button clicked for profile: {profile_name}")
+                
+            # Show confirmation dialog
+            reply_box = QMessageBox(self)
+            reply_box.setWindowTitle("Confirm Removal")
+            reply_box.setText(f"Are you sure you want to remove the profile '{profile_name}'?")
+            reply_box.setStyleSheet("QLabel { color: black; }")
+            reply_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            self.center_on_cursor(reply_box)
+            reply = reply_box.exec_()
+            
+            if reply == QMessageBox.Yes:
+                # Make sure to stop the profile before removing it
+                try:
+                    if profile_name in self.manager.processes:
+                        print(f"Stopping profile {profile_name} before removal")
+                        self.manager.stop_processor(profile_name)
+                except Exception as stop_error:
+                    print(f"Error stopping profile before removal: {stop_error}")
+                
+                # Now attempt to remove the profile
+                try:
+                    print(f"Removing profile {profile_name} directly from remove_job")
+                    self.manager.remove_profile(profile_name)
+                    print(f"Successfully removed profile {profile_name}")
+                    
+                    # Update UI
+                    self.load_profiles()
+                    self.update_profile_status_menu()
+                    
+                    # Since the profile is removed, we don't try to restore the selection
+                except Exception as remove_error:
+                    print(f"Error removing profile: {remove_error}")
+                    print(traceback.format_exc())
+                    QMessageBox.critical(self, "Error", f"Failed to remove profile: {str(remove_error)}")
+        except Exception as e:
+            print(f"Error in remove_job: {e}")
+            print(traceback.format_exc())
+            QMessageBox.critical(self, "Error", f"Failed to remove job: {str(e)}")
 
     def toggle_job_status(self):
-        selected_item = self.job_list.currentItem()
-        if selected_item:
-            profile_name = selected_item.text().split(" - ")[0]
-            self.manager.toggle_profile_status(profile_name)
-            self.load_profiles()
+        """Toggle the status of the currently selected job profile."""
+        try:
+            selected_item = self.job_list.currentItem()
+            if selected_item:
+                profile_text = selected_item.text()
+                profile_name = profile_text.split(" - ")[0]
+                status = profile_text.split(" - ")[1].lower()
+                
+                print(f"Toggle button clicked for profile: {profile_name}, current status: {status}")
+                
+                # Store selected row index
+                current_row = self.job_list.row(selected_item)
+                
+                # Directly perform the operation without threading
+                if status == "active":
+                    # Call the JobManager directly
+                    print(f"Pausing profile {profile_name} directly from toggle_job_status")
+                    self.manager.pause_profile(profile_name)
+                else:
+                    # Call the JobManager directly
+                    print(f"Starting profile {profile_name} directly from toggle_job_status")
+                    self.manager.unpause_profile(profile_name)
+                    
+                # Immediately update the UI
+                self.update_profile_list()
+                
+                # Try to restore selection
+                if current_row < self.job_list.count():
+                    self.job_list.setCurrentRow(current_row)
+        except Exception as e:
+            print(f"Error in toggle_job_status: {e}")
+            print(traceback.format_exc())
+            QMessageBox.critical(self, "Error", f"Failed to toggle job status: {str(e)}")
 
     def set_core_cap(self):
-        dialog = CoreCapDialog(self.core_cap, self.core_count, self)
-        if dialog.exec_():
-            new_cap = dialog.get_value()
-            self.core_cap = new_cap
-            self.queue_manager.core_cap = new_cap
-            self.manager.update_core_cap(new_cap)
-            self.update_core_cap_button()
+        try:
+            dialog = CoreCapDialog(self.core_cap, self.core_count, self.logical_core_count, self.max_cores_per_profile, self)
+            if dialog.exec_():
+                values = dialog.get_values()
+                new_cap = values['core_cap']
+                new_max_per_profile = values['max_per_profile']
+                
+                # Ensure values don't exceed system constraints
+                new_cap = min(new_cap, self.core_count)
+                new_max_per_profile = min(new_max_per_profile, self.core_count)
+                
+                # Check if the cap is being reduced
+                cap_reduced = new_cap < self.core_cap
+                
+                # Update settings
+                self.core_cap = new_cap
+                self.max_cores_per_profile = new_max_per_profile
+                
+                # Update in manager
+                self.manager.update_core_cap(new_cap)
+                self.manager.update_max_cores_per_profile(new_max_per_profile)
+                
+                # Update UI
+                self.update_core_cap_button()
+                
+                # If we reduced the cap, explicitly rebalance cores
+                if cap_reduced:
+                    self.manager.rebalance_cores()
+                    self.update_profile_list()
+                    
+                    # Inform the user about the rebalancing
+                    QMessageBox.information(self, "Core Settings Changed", 
+                        "Core settings have been updated and profiles have been automatically rebalanced.")
+                else:
+                    # Just inform about the change
+                    QMessageBox.information(self, "Core Settings Changed", 
+                        "Core settings have been updated. Changes will take effect when profiles are restarted.")
+        except Exception as e:
+            print(f"Error setting core cap: {e}")
+            print(traceback.format_exc())
+            QMessageBox.critical(self, "Error", f"Failed to set core cap: {str(e)}")
+        
+    def update_cores_per_processor(self, profile_name, cores_per_processor):
+        """Update the cores_per_processor setting for a specific profile."""
+        try:
+            if profile_name in self.config['profiles']:
+                # Ensure cores_per_processor is at least 1
+                cores_per_processor = max(1, cores_per_processor)
+                
+                # Update the cores_per_processor setting in the profile
+                self.config['profiles'][profile_name]['cores_per_processor'] = cores_per_processor
+                
+                # Save the configuration
+                self.save_config()
+                
+                print(f"Updated {profile_name} to use {cores_per_processor} cores per processor")
+                
+                # Restart the profile if it's active
+                if self.config['profiles'][profile_name].get('status') == 'Active':
+                    print(f"Restarting {profile_name} to apply core changes")
+                    self.stop_processor(profile_name)
+                    
+                    # Get paths from profile
+                    jpeg_path = self.config['profiles'][profile_name].get('JPEG', '')
+                    tiff_path = self.config['profiles'][profile_name].get('TIFF', '')
+                    complete_path = self.config['profiles'][profile_name].get('COMPLETE', '')
+                    
+                    # Restart with new core settings
+                    self.start_processor(profile_name, "jpeg_processor.py", jpeg_path, complete_path, cores_per_processor)
+                    self.start_processor(profile_name, "tiff_processor.py", tiff_path, complete_path, cores_per_processor)
+                    
+                return True
+            return False
+        except Exception as e:
+            print(f"Error updating cores per processor: {e}")
+            print(traceback.format_exc())
+            return False
 
-    def update_core_cap_button(self):
-        self.core_cap_btn.setText(f"Set Core Cap (Currently: {self.core_cap})")
+    def update_core_cap_button(self, allocated_cores=None):
+        try:
+            if allocated_cores is None:
+                # Calculate total allocated cores
+                profiles = self.manager.get_profiles_with_status()
+                allocated_cores = 0
+                for profile_name, details in profiles.items():
+                    cores_per_processor = details.get('cores_per_processor', 3)
+                    allocated_cores += cores_per_processor * 2
+                    
+            # Show allocated vs available cores
+            self.core_cap_btn.setText(
+                f"Set Core Limits (Using: {allocated_cores}/{self.core_cap} cores, "
+                f"Max/Profile: {self.max_cores_per_profile}, Physical: {self.core_count})"
+            )
+        except Exception as e:
+            print(f"Error updating core cap button: {e}")
+            # Fallback to simpler display if error occurs
+            self.core_cap_btn.setText(
+                f"Set Core Limits (Total: {self.core_cap}, Max/Profile: {self.max_cores_per_profile})"
+            )
+
+    def start_all_profiles(self):
+        """Start all profiles by marking them as active and starting processors."""
+        try:
+            # Show confirmation dialog
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Start All Profiles")
+            msg.setText("Are you sure you want to start all profiles?")
+            msg.setStyleSheet("QLabel { color: black; }")
+            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            self.center_on_cursor(msg)
+            reply = msg.exec_()
+            
+            if reply == QMessageBox.Yes:
+                # Start directly without threading to ensure it works
+                print("Starting all profiles...")
+                self.manager.start_all_profiles()
+                # Update UI immediately
+                self.update_profile_list()
+                print("All profiles started")
+        except Exception as e:
+            print(f"Error starting all profiles: {e}")
+            print(traceback.format_exc())
+            QMessageBox.critical(self, "Error", f"Failed to start all profiles: {str(e)}")
+
+    def stop_all_profiles(self):
+        """Stop all running profiles."""
+        try:
+            # Show confirmation dialog
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Stop All Profiles")
+            msg.setText("Are you sure you want to stop all profiles?")
+            msg.setStyleSheet("QLabel { color: black; }")
+            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            self.center_on_cursor(msg)
+            reply = msg.exec_()
+            
+            if reply == QMessageBox.Yes:
+                # Stop directly without threading to ensure it works
+                print("Stopping all profiles...")
+                self.manager.stop_all_profiles()
+                # Update UI immediately
+                self.update_profile_list()
+                print("All profiles stopped")
+        except Exception as e:
+            print(f"Error stopping all profiles: {e}")
+            print(traceback.format_exc())
+            QMessageBox.critical(self, "Error", f"Failed to stop all profiles: {str(e)}")
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)  # Prevent the app from quitting when the main window is closed
-    window = MainUI()
-    window.show()
-    sys.exit(app.exec_())
-
+    try:
+        multiprocessing.freeze_support()  # Required for frozen executables with multiprocessing
+        app = QApplication(sys.argv)
+        app.setQuitOnLastWindowClosed(False)  # Prevent the app from quitting when the main window is closed
+        
+        # Create and show the main window
+        window = MainUI()
+        window.show()
+        
+        # Print confirmation that we've reached the event loop
+        print("Entering Qt event loop")
+        sys.exit(app.exec_())
+    except Exception as e:
+        print(f"Critical application error: {e}")
+        print(traceback.format_exc())
+        
+        # Create minimal error dialog if possible
+        try:
+            if 'app' in locals():
+                QMessageBox.critical(None, "Fatal Error", 
+                                 f"A fatal error occurred: {str(e)}")
+        except:
+            pass
+        
+        sys.exit(1)
