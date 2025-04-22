@@ -11,10 +11,10 @@ import argparse
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
-# Configure PIL to be more tolerant of damaged files
+# make PIL handle broken images better
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-# Configure logging
+# setup basic logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -39,21 +39,21 @@ class PDFProcessor:
         self.dpi = dpi
         self.success_count = 0
         self.failure_count = 0
-        self.processed_folders = set()  # Track processed folders
-        self.lock = threading.Lock()  # Lock for thread-safe file operations
+        self.processed_folders = set()  # track folders we've already processed
+        self.lock = threading.Lock()  # lock for thread-safe operations
 
     def _validate_tiff(self, file_path):
-        """Ensure TIFF file is valid and can be opened"""
+        """check if tiff file is valid and can be opened"""
         try:
-            # First check if file exists and has size > 0
+            # first check basics - file exists and has size
             if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
                 logging.error(f"TIFF file {file_path} is empty or doesn't exist")
                 return False
                 
-            # Try to open and verify the TIFF
+            # try opening the file to make sure it's usable
             with Image.open(file_path) as img:
-                img.load()  # Verify the file can be loaded
-                # Make sure it's a valid TIFF format
+                img.load()  # force load to catch any issues
+                # make sure it's actually a tiff
                 if img.format != "TIFF":
                     logging.error(f"File {file_path} is not a valid TIFF format")
                     return False
@@ -63,7 +63,7 @@ class PDFProcessor:
             return False
 
     def _safe_remove(self, file_path, max_retries=3, retry_delay=1):
-        """Safely remove a file with retries, skipping if it's locked or doesn't exist"""
+        """try to remove a file with retries in case it's locked"""
         if not os.path.exists(file_path):
             return
             
@@ -79,31 +79,30 @@ class PDFProcessor:
                     logging.warning(f"Failed to remove file {file_path}: {str(e)}")
 
     def _convert_page(self, page, output_path):
-        """Convert single PDF page to TIFF with CCITT Group 4 compression"""
+        """convert one pdf page to TIFF with group4 compression"""
         temp_png = None
         try:
-            # Create a temporary file path for the PNG with unique name based on timestamp
+            # create temp file for intermediate png
             temp_dir = os.path.dirname(output_path)
             temp_basename = f"temp_{os.path.basename(output_path).replace('.tif', '')}_{int(time.time()*1000)}.png"
             temp_png = os.path.join(temp_dir, temp_basename)
             
-            # Generate pixmap with specified DPI (use monochrome rendering for better results with Group 4)
+            # generate pixmap with our dpi settings
             pix = page.get_pixmap(dpi=self.dpi, alpha=False)
             
-            # Save as uncompressed PNG for intermediate processing
+            # save as png first - easier to work with
             pix.pil_save(temp_png, format="PNG")
             
-            # Make sure temp file was created
+            # check temp file was created properly
             if not os.path.exists(temp_png) or os.path.getsize(temp_png) == 0:
                 raise ValueError(f"Failed to create temporary PNG file: {temp_png}")
             
-            # Convert to TIFF using PIL with proper handling for Group 4 compression
+            # convert to TIFF using PIL for compression settings
             with Image.open(temp_png) as img:
-                # Convert to binary (1-bit) with threshold
-                # This is critical for Group 4 compression which requires 1-bit images
+                # convert to binary for group4 compression
                 binary_img = img.convert("L").point(lambda x: 0 if x < 128 else 255, '1')
                 
-                # Save with explicit Group 4 compression and resolution
+                # save with group4 compression
                 binary_img.save(
                     output_path, 
                     "TIFF", 
@@ -111,31 +110,31 @@ class PDFProcessor:
                     dpi=(self.dpi, self.dpi)
                 )
             
-            # Verify the TIFF is valid and can be opened
+            # verify the TIFF is good
             if not self._validate_tiff(output_path):
                 raise ValueError(f"TIFF validation failed for {output_path}")
                 
             return True
         except Exception as e:
             logging.error(f"PDF page conversion failed: {str(e)}")
-            # Clean up any partial output
+            # clean up any partial output
             if os.path.exists(output_path):
                 self._safe_remove(output_path)
             return False
         finally:
-            # Always clean up the temporary file
+            # always clean up temp files
             if temp_png and os.path.exists(temp_png):
                 self._safe_remove(temp_png)
 
     def _convert_jpeg_to_tiff(self, jpeg_path, output_path):
-        """Convert JPEG to TIFF with CCITT Group 4 compression"""
+        """convert a jpeg file to tiff with group4 compression"""
         try:
             with Image.open(jpeg_path) as img:
-                # Convert to grayscale
+                # convert to grayscale first
                 gray_img = img.convert("L")
-                # Apply threshold to get binary image
+                # make it binary (black and white only)
                 binary_img = gray_img.point(lambda x: 0 if x < 128 else 255, '1')
-                # Save as TIFF with CCITT Group 4 compression
+                # save as TIFF with group4
                 binary_img.save(
                     output_path, 
                     "TIFF", 
@@ -143,7 +142,7 @@ class PDFProcessor:
                     dpi=(self.dpi, self.dpi)
                 )
             
-            # Verify the TIFF is valid
+            # make sure the tiff is valid
             if not self._validate_tiff(output_path):
                 raise ValueError("TIFF validation failed")
                 
@@ -155,20 +154,20 @@ class PDFProcessor:
             return False
 
     def process_jpeg(self, jpeg_path):
-        """Process a single JPEG file to TIFF"""
+        """process a single jpeg file to tiff"""
         try:
             logging.info(f"Processing JPEG: {jpeg_path}")
             
-            # Create output path
+            # setup output path
             base_name = os.path.splitext(os.path.basename(jpeg_path))[0]
             output_dir = os.path.dirname(jpeg_path)
             output_path = os.path.join(output_dir, f"{base_name}.tif")
             
-            # Convert JPEG to TIFF
+            # do the conversion
             success = self._convert_jpeg_to_tiff(jpeg_path, output_path)
             
             if success:
-                # Remove original JPEG after successful conversion
+                # clean up original jpeg if successful
                 self.success_count += 1
                 logging.info(f"Successfully converted JPEG: {jpeg_path}")
                 self._safe_remove(jpeg_path)
@@ -184,13 +183,13 @@ class PDFProcessor:
             return False
 
     def process_pdf(self, pdf_path):
-        """Convert PDF to validated TIFF files"""
+        """convert pdf file to tiff files - one per page"""
         success = True
         created_files = []
         doc = None
         
         try:
-            # Open the PDF with proper error handling
+            # open the pdf file
             doc = fitz.open(pdf_path)
             total_pages = len(doc)
             base_name = os.path.splitext(os.path.basename(pdf_path))[0]
@@ -198,14 +197,14 @@ class PDFProcessor:
 
             logging.info(f"Processing PDF: {pdf_path} ({total_pages} pages)")
             
-            # Process each page with proper error handling
+            # process each page
             for page_num in range(total_pages):
                 output_path = os.path.join(output_dir, f"{base_name}_page_{page_num+1:04d}.tif")
                 
                 try:
-                    # Use a lock for thread-safe file operations
+                    # use lock for thread safety
                     with self.lock:
-                        # Process the page
+                        # process the page
                         if self._convert_page(doc[page_num], output_path):
                             created_files.append(output_path)
                             self.success_count += 1
@@ -219,7 +218,7 @@ class PDFProcessor:
                     self.failure_count += 1
                     logging.error(f"Error processing page {page_num+1}: {str(e)}")
             
-            # Only consider success if all pages were converted
+            # only successful if all pages worked
             if success and len(created_files) == total_pages:
                 logging.info(f"All {total_pages} pages of {pdf_path} processed successfully")
             else:
@@ -234,35 +233,35 @@ class PDFProcessor:
             return False
             
         finally:
-            # Always close the document to prevent memory leaks
+            # always close the pdf to avoid memory leaks
             if doc:
                 try:
                     doc.close()
                 except Exception as e:
                     logging.warning(f"Error closing PDF document: {str(e)}")
                     
-            # Handle cleanup based on success state
+            # cleanup based on success
             if success:
-                # Remove the original PDF if successful
+                # remove original pdf if all went well
                 self._safe_remove(pdf_path)
             else:
-                # Leave the created files as they may still be useful
+                # keep the created files anyway - might be useful
                 pass
 
     def process_folder(self, folder_path):
-        """Process all PDFs and JPEGs in a folder with validation"""
+        """process all pdfs and jpegs in a folder"""
         try:
-            # First check if the folder exists - it might have been moved already
+            # check folder still exists
             if not os.path.exists(folder_path):
                 logging.info(f"Folder no longer exists: {folder_path}")
                 return False
                 
-            # Check if folder has processable files before deciding to skip
+            # see if there's anything to process
             pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.pdf')]
             jpeg_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.jpg', '.jpeg'))]
             
             if not pdf_files and not jpeg_files:
-                # No PDF or JPEG files to process
+                # nothing to process
                 if folder_path in self.processed_folders:
                     logging.info(f"Folder already processed and has no new files: {folder_path}")
                     return True
@@ -272,17 +271,16 @@ class PDFProcessor:
                     self.processed_folders.add(folder_path)
                     return True
             
-            # If we found processable files, always process the folder
-            # This allows reprocessing when new files are added
+            # got files to process
             if folder_path in self.processed_folders:
                 logging.info(f"Folder previously processed but contains new files: {folder_path}")
                 self.processed_folders.remove(folder_path)
             
-            # Validate folder stability
+            # make sure folder isn't still being written to
             if not self._is_folder_stable(folder_path):
                 return False
 
-            # Process PDFs
+            # process pdfs
             pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.pdf')]
             pdf_results = []
             
@@ -291,7 +289,7 @@ class PDFProcessor:
                 result = self.process_pdf(pdf_path)
                 pdf_results.append(result)
 
-            # Process JPEGs
+            # process jpegs
             jpeg_files = [f for f in os.listdir(folder_path) 
                          if f.lower().endswith(('.jpg', '.jpeg'))]
             jpeg_results = []
@@ -301,7 +299,7 @@ class PDFProcessor:
                 result = self.process_jpeg(jpeg_path)
                 jpeg_results.append(result)
 
-            # Only move folder if all files were processed successfully
+            # move folder if everything worked
             all_successful = True
             if pdf_files or jpeg_files:
                 if not all(pdf_results + jpeg_results):
@@ -310,12 +308,12 @@ class PDFProcessor:
                     
                 if all_successful:
                     self._move_folder(folder_path)
-                    self.processed_folders.add(folder_path)  # Mark folder as processed
+                    self.processed_folders.add(folder_path)  # mark as done
             else:
-                # Handle empty folders
+                # empty folders just get moved
                 logging.info(f"No PDF or JPEG files found in {folder_path}")
                 self._move_folder(folder_path)
-                self.processed_folders.add(folder_path)  # Mark folder as processed
+                self.processed_folders.add(folder_path)
                 
             return all_successful
 
@@ -324,7 +322,7 @@ class PDFProcessor:
             return False
 
     def _is_folder_stable(self, folder_path, timeout=30, check_interval=2):
-        """Ensure folder has finished receiving files"""
+        """check if folder is done changing before processing"""
         logging.info(f"Verifying folder stability: {folder_path}")
         try:
             initial_state = None
@@ -342,13 +340,13 @@ class PDFProcessor:
                 time.sleep(check_interval)
 
             logging.warning(f"Folder not stable after {timeout} seconds, processing anyway")
-            return True  # Process anyway after timeout
+            return True  # process anyway after timeout
         except Exception as e:
             logging.error(f"Stability check failed: {str(e)}")
             return False
 
     def _get_folder_state(self, folder_path):
-        """Get folder state signature"""
+        """get folder state info to check if it's changing"""
         try:
             if not os.path.exists(folder_path):
                 raise FileNotFoundError(f"Folder not found: {folder_path}")
@@ -365,19 +363,19 @@ class PDFProcessor:
             return None
 
     def _move_folder(self, src_folder):
-        """Safely move processed folder"""
+        """move processed folder to output location"""
         try:
             dest_folder = os.path.join(self.output_directory, os.path.basename(src_folder))
             
             if os.path.exists(dest_folder):
                 logging.warning(f"Destination exists: {dest_folder}")
-                # Use a timestamp to create a unique folder name
+                # use timestamp to make unique name
                 dest_folder = f"{dest_folder}_{int(time.time())}"
                 
-            # Ensure destination parent directory exists
+            # make sure destination folder exists
             os.makedirs(os.path.dirname(dest_folder), exist_ok=True)
             
-            # Move the folder
+            # do the move
             shutil.move(src_folder, dest_folder)
             logging.info(f"Moved folder: {src_folder} -> {dest_folder}")
             return True
@@ -392,9 +390,8 @@ class FolderHandler(FileSystemEventHandler):
     def on_created(self, event):
         if event.is_directory:
             logging.info(f"New folder detected: {event.src_path}")
-            time.sleep(5)  # Allow time for file transfers
-            # Always remove from processed set when a new folder is created
-            # This allows reprocessing of folders with the same name
+            time.sleep(5)  # give time for file transfers
+            # reset if folder gets recreated
             if event.src_path in self.processor.processed_folders:
                 self.processor.processed_folders.remove(event.src_path)
             self.processor.process_folder(event.src_path)
@@ -402,8 +399,8 @@ class FolderHandler(FileSystemEventHandler):
     def on_modified(self, event):
         if event.is_directory:
             logging.info(f"Folder modified: {event.src_path}")
-            time.sleep(5)  # Allow time for file transfers
-            # Check if the folder has processable files before processing
+            time.sleep(5)  # give time for file transfers
+            # check for files before processing
             if os.path.exists(event.src_path):
                 try:
                     pdf_files = [f for f in os.listdir(event.src_path) if f.lower().endswith('.pdf')]
@@ -420,7 +417,7 @@ class FolderHandler(FileSystemEventHandler):
 def main():
     args = parse_args()
 
-    # Validate directories
+    # check directories
     if not os.path.exists(args.watch_dir):
         logging.error(f"Watch directory missing: {args.watch_dir}")
         return
@@ -430,29 +427,29 @@ def main():
 
     processor = PDFProcessor(args.watch_dir, args.output_dir, dpi=args.dpi)
 
-    # Process existing folders first
+    # process existing folders first
     existing_folders = [os.path.join(args.watch_dir, folder) 
                        for folder in os.listdir(args.watch_dir) 
                        if os.path.isdir(os.path.join(args.watch_dir, folder))]
 
     if args.max_workers > 1:
-        # Use ThreadPoolExecutor for concurrent processing
+        # use threads for parallel processing
         with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
             futures = [executor.submit(processor.process_folder, folder) for folder in existing_folders]
             for future in futures:
                 try:
-                    future.result()  # Wait for each task to complete
+                    future.result()  # wait for completion
                 except Exception as e:
                     logging.error(f"Error processing folder: {str(e)}")
     else:
-        # Process folders sequentially
+        # process one by one
         for folder in existing_folders:
             processor.process_folder(folder)
 
-    # Set up watcher
+    # setup watcher
     event_handler = FolderHandler(processor)
     observer = Observer()
-    observer.schedule(event_handler, args.watch_dir, recursive=False)  # Non-recursive to avoid processing nested folders
+    observer.schedule(event_handler, args.watch_dir, recursive=False)  # non-recursive to avoid nested folders
     observer.start()
 
     try:
@@ -463,7 +460,7 @@ def main():
         observer.stop()
     observer.join()
 
-    # Final report
+    # final summary
     logging.info(f"Processing complete. Successes: {processor.success_count} | Failures: {processor.failure_count}")
 
 if __name__ == "__main__":

@@ -8,33 +8,33 @@ import time
 import logging
 import traceback
 
-# Determine the script directory for absolute paths
+# figure out the script directory for absolute paths
 if getattr(sys, 'frozen', False):
-    # If running as a frozen exe
+    # running as a frozen exe
     script_dir = os.path.dirname(sys.executable)
 else:
-    # If running as a regular Python script
+    # regular python script
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-# Create log file with absolute path
+# setup log file with absolute path
 log_file = os.path.join(script_dir, "job_manager.log")
 print(f"Job Manager using log file: {log_file}")
 
-# Configure logging to both file and console
+# setup logging to file and console
 logging.basicConfig(
     filename=log_file,
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Add console handler to see logs in terminal too
+# add console logging too
 console = logging.StreamHandler()
 console.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 console.setFormatter(formatter)
 logging.getLogger('').addHandler(console)
 
-# Log startup information
+# log startup info
 logging.info(f"Started job_manager")
 logging.info(f"Python executable: {sys.executable}")
 logging.info(f"Script directory: {script_dir}")
@@ -42,70 +42,70 @@ logging.info(f"Current working directory: {os.getcwd()}")
 
 class JobManager:
     def __init__(self, config_file):
-        """Initialize the JobManager with a path to the config file."""
+        """start up the job manager with config file path"""
         self.config_file = config_file
-        self.processes = {}  # Keep track of running processes (one per job)
+        self.processes = {}  # track running processes by job
         self.load_config()
-        self.transitioning_profiles = set()  # Track profiles currently changing state
+        self.transitioning_profiles = set()  # track profiles changing state
         
-        # Log initialization
+        # log init
         logging.info(f"JobManager initialized with config file: {config_file}")
         if not os.path.exists(config_file):
             logging.warning(f"Config file does not exist, will create: {config_file}")
 
     def load_config(self):
-        """Loads the configuration from the JSON file."""
+        """load settings from json file"""
         if not os.path.exists(self.config_file):
-            # If the config file doesn't exist, create a blank template
+            # create empty template if missing
             self.config = {
                 "network_folder": "", 
                 "profiles": {}, 
                 "core_cap": multiprocessing.cpu_count(),
-                "max_cores_per_profile": 6  # Default max cores per profile
+                "max_cores_per_profile": 6  # default max per profile
             }
             self.save_config()
         else:
             with open(self.config_file, 'r') as f:
                 self.config = json.load(f)
                 
-            # Ensure new fields exist in older config files
+            # add missing fields to older configs
             if "max_cores_per_profile" not in self.config:
                 self.config["max_cores_per_profile"] = 6
                 self.save_config()
 
     def save_config(self):
-        """Saves the current configuration to the JSON file."""
+        """save current settings to json file"""
         with open(self.config_file, 'w') as f:
             json.dump(self.config, f, indent=4)
 
     def update_core_cap(self, new_core_cap):
-        """Updates the core cap in the config file."""
+        """change the max cores setting"""
         self.config['core_cap'] = new_core_cap
         self.save_config()
 
     def update_max_cores_per_profile(self, new_max):
-        """Updates the maximum cores per profile setting."""
+        """change max cores per profile setting"""
         self.config['max_cores_per_profile'] = new_max
         self.save_config()
 
     def get_core_cap(self):
-        """Returns the current core cap from the config file."""
+        """get current core cap setting"""
         return self.config.get('core_cap', multiprocessing.cpu_count())
 
     def get_max_cores_per_profile(self):
-        """Returns the maximum cores per profile setting."""
+        """get max cores per profile setting"""
         return self.config.get('max_cores_per_profile', 6)
 
     def update_network_folder(self, folder):
-        """Updates the top-level network folder in the config."""
+        """set the main network folder path"""
         self.config['network_folder'] = folder
         self.save_config()
 
     def get_profiles_with_status(self):
-        """Returns a dictionary of profiles with their status (active/paused/transitioning)."""
+        """get all profiles with their status info"""
         profiles = self.config.get('profiles', {})
         
-        # Mark transitioning profiles
+        # update display status for transitioning profiles
         for profile_name in self.transitioning_profiles:
             if profile_name in profiles:
                 current_status = profiles[profile_name]['status']
@@ -117,34 +117,34 @@ class JobManager:
         return profiles
 
     def add_profile(self, profile_name):
-        """Adds a new job profile, creates necessary directories, and starts the processors."""
+        """add a new job profile with needed directories"""
         base_folder = os.path.join(self.config['network_folder'], profile_name)
         jpeg_folder = os.path.join(base_folder, "JPEG")
         tiff_folder = os.path.join(base_folder, "TIFF")
         complete_folder = os.path.join(base_folder, "COMPLETE")
 
-        # Create the required directories for the profile
+        # create the directories
         os.makedirs(jpeg_folder, exist_ok=True)
         os.makedirs(tiff_folder, exist_ok=True)
         os.makedirs(complete_folder, exist_ok=True)
 
-        # Calculate available cores for this profile
+        # figure out reasonable core allocation
         profiles = self.get_profiles_with_status()
         total_allocated_cores = 0
         for existing_profile, details in profiles.items():
             cores_per_processor = details.get('cores_per_processor', 3)
-            total_allocated_cores += cores_per_processor * 2  # Total is JPEG + TIFF
+            total_allocated_cores += cores_per_processor * 2  # both jpeg and tiff
         
         available_cores = max(2, self.get_core_cap() - total_allocated_cores)
         max_cores_per_profile = self.get_max_cores_per_profile()
         
-        # Calculate reasonable cores_per_processor value
-        # Each profile gets JPEG + TIFF processors, so divide by 2
+        # set reasonable cores_per_processor
+        # divide by 2 since each profile needs jpeg + tiff
         cores_per_processor = max(1, min(3, min(available_cores, max_cores_per_profile) // 2))
         
         logging.info(f"Adding profile {profile_name} with {cores_per_processor} cores per processor")
 
-        # Add the profile to the configuration
+        # add to config
         self.config['profiles'][profile_name] = {
             "JPEG": jpeg_folder,
             "TIFF": tiff_folder,
@@ -155,46 +155,46 @@ class JobManager:
         }
         self.save_config()
 
-        # Start the processors when adding a new job
+        # start processors when adding
         return profile_name
 
     def remove_profile(self, profile_name):
-        """Removes a job profile and its corresponding directories."""
+        """remove a job profile and its directories"""
         base_folder = os.path.join(self.config['network_folder'], profile_name)
 
-        # Stop any running processors for this profile before removing
+        # stop any running processors first
         self.stop_processor(profile_name)
 
-        # Attempt to remove the profile's directory
+        # try to remove the directory
         try:
             shutil.rmtree(base_folder)
             logging.info(f"Successfully removed profile folder: {base_folder}")
         except OSError as e:
             logging.error(f"Error removing profile folder: {e}")
 
-        # Remove the profile from the configuration
+        # remove from config
         if profile_name in self.config['profiles']:
             del self.config['profiles'][profile_name]
             self.save_config()
             
-        # After removing a profile, rebalance cores if needed
+        # rebalance cores after removing
         self.rebalance_cores()
 
     def rebalance_cores(self):
-        """Rebalance cores across active profiles to optimize usage."""
+        """redistribute cores among active profiles"""
         try:
             profiles = self.get_profiles_with_status()
             active_profiles = {name: details for name, details in profiles.items() 
                               if details['status'] == 'Active'}
             
             if not active_profiles:
-                return  # No active profiles to rebalance
+                return  # nothing to do if no active profiles
             
-            # Calculate optimal cores per processor based on core cap
+            # calculate optimal core allocation
             core_cap = self.get_core_cap()
             max_cores_per_profile = self.get_max_cores_per_profile()
             
-            # Each profile uses 2 processors (JPEG + TIFF)
+            # each profile runs 2 processors (jpeg + tiff)
             optimal_cores_per_processor = min(
                 max_cores_per_profile // 2,
                 max(1, (core_cap // (len(active_profiles) * 2)))
@@ -203,17 +203,17 @@ class JobManager:
             logging.info(f"Rebalancing cores: {len(active_profiles)} active profiles, "
                         f"optimal is {optimal_cores_per_processor} cores per processor")
             
-            # Update each profile if needed
+            # update each profile if needed
             for profile_name, details in active_profiles.items():
                 current_cores = details.get('cores_per_processor', 3)
                 if current_cores != optimal_cores_per_processor:
                     logging.info(f"Adjusting {profile_name} from {current_cores} to "
                                 f"{optimal_cores_per_processor} cores per processor")
                     
-                    # Update in config
+                    # update in config
                     self.config['profiles'][profile_name]['cores_per_processor'] = optimal_cores_per_processor
                     
-                    # Restart if active
+                    # restart if active
                     if profile_name in self.processes:
                         self.stop_processor(profile_name)
                         profile = self.config['profiles'][profile_name]
@@ -224,7 +224,7 @@ class JobManager:
                                             profile["TIFF"], profile["COMPLETE"], 
                                             optimal_cores_per_processor)
             
-            # Save the updated config
+            # save changes
             self.save_config()
             
         except Exception as e:
@@ -232,51 +232,51 @@ class JobManager:
             logging.error(traceback.format_exc())
 
     def pause_profile(self, profile_name):
-        """Marks a profile as paused in the configuration and stops the processors."""
+        """mark profile as paused and stop processors"""
         if profile_name in self.config['profiles']:
             self.transitioning_profiles.add(profile_name)
             
-            # Stop the processors
+            # stop running processors
             self.stop_processor(profile_name)
             
-            # Update the status
+            # update status
             self.config['profiles'][profile_name]['status'] = "Paused"
             self.config['profiles'][profile_name]['display_status'] = "Paused"
             self.save_config()
             
-            # Remove from transitioning set
+            # done transitioning
             if profile_name in self.transitioning_profiles:
                 self.transitioning_profiles.remove(profile_name)
                 
-            # After pausing a profile, rebalance cores if needed
+            # rebalance cores after pausing
             self.rebalance_cores()
 
     def unpause_profile(self, profile_name):
-        """Marks a profile as active in the configuration and restarts the processors."""
+        """mark profile as active and start processors"""
         if profile_name in self.config['profiles']:
             self.transitioning_profiles.add(profile_name)
             
-            # Update the status immediately
+            # update status immediately
             self.config['profiles'][profile_name]['status'] = "Active"
             self.config['profiles'][profile_name]['display_status'] = "Active"
             self.save_config()
             
-            # Rebalance cores before starting
+            # rebalance before starting
             self.rebalance_cores()
             
-            # Restart the processors with potentially updated core settings
+            # restart processors with updated core settings
             profile = self.config['profiles'][profile_name]
-            cores_per_processor = profile.get("cores_per_processor", 3)  # Default if not specified
+            cores_per_processor = profile.get("cores_per_processor", 3)  # default if not set
             
             self.start_processor(profile_name, "jpeg_processor.py", profile["JPEG"], profile["COMPLETE"], cores_per_processor)
             self.start_processor(profile_name, "tiff_processor.py", profile["TIFF"], profile["COMPLETE"], cores_per_processor)
             
-            # Remove from transitioning set
+            # done transitioning
             if profile_name in self.transitioning_profiles:
                 self.transitioning_profiles.remove(profile_name)
 
     def toggle_profile_status(self, profile_name):
-        """Toggles the profile status between active and paused."""
+        """toggle between active and paused"""
         if profile_name in self.config['profiles']:
             if profile_name in self.transitioning_profiles:
                 logging.warning(f"Profile {profile_name} is already transitioning, cannot toggle")
@@ -289,24 +289,24 @@ class JobManager:
                 self.unpause_profile(profile_name)
 
     def start_processor(self, profile_name, processor_name, watch_dir, output_dir, cores=3):
-        """Start a processor (JPEG/TIFF) using the appropriate .exe or .py file with specified cores."""
+        """start a processor (jpeg/tiff) with specified cores"""
         if profile_name not in self.processes:
             self.processes[profile_name] = {}
 
-        # Create log file in the script directory
+        # create log file
         log_file = os.path.join(script_dir, f"{profile_name}_{processor_name}.log")
         
         try:
-            # Use sys.executable to explicitly use the Python interpreter
+            # use explicit python interpreter
             command = [
-                sys.executable,  # Explicitly use Python interpreter
-                os.path.join(script_dir, processor_name),  # Full path to the script
+                sys.executable,  # use current python
+                os.path.join(script_dir, processor_name),  # full path to script
                 f'--watch-dir={watch_dir}',
                 f'--output-dir={output_dir}',
                 f'--max-workers={cores}'
             ]
 
-            # Open log file for writing
+            # open log for writing
             with open(log_file, "w") as log:
                 process = subprocess.Popen(
                     command,
@@ -328,21 +328,21 @@ class JobManager:
             return None
             
     def stop_processor(self, profile_name):
-        """Stop any running processors for the given profile."""
+        """stop processors for a profile"""
         if profile_name in self.processes:
             for processor_name, process in self.processes[profile_name].items():
                 try:
                     logging.info(f"Stopping {processor_name} for profile {profile_name}")
                     
                     process.terminate()
-                    # Wait for up to 5 seconds for the process to terminate
+                    # give it a chance to exit cleanly
                     for i in range(10):
                         if process.poll() is not None:
                             logging.info(f"Process terminated normally after {(i+1)*0.5} seconds")
                             break
                         time.sleep(0.5)
                     
-                    # If it's still running, force kill
+                    # force kill if still running
                     if process.poll() is None:
                         logging.info(f"Process did not terminate gracefully, force killing...")
                         if sys.platform == 'win32':
@@ -355,19 +355,19 @@ class JobManager:
                     logging.error(f"Error terminating {processor_name} for profile {profile_name}: {e}")
                     logging.error(traceback.format_exc())
             
-            # Clean up processes dictionary
+            # cleanup process dictionary
             del self.processes[profile_name]
 
     def start_all_profiles(self):
-        """Start all profiles marked as Active in the configuration."""
-        # First, rebalance cores to ensure optimal allocation
+        """start all profiles marked as Active"""
+        # rebalance cores first for optimal allocation
         self.rebalance_cores()
         
-        # Now start all active profiles
+        # now start all active ones
         active_count = 0
         for profile_name, details in self.config['profiles'].items():
             if details['status'] == "Active":
-                cores_per_processor = details.get("cores_per_processor", 3)  # Default if not specified
+                cores_per_processor = details.get("cores_per_processor", 3)  # default if not set
                 jpeg_result = self.start_processor(profile_name, "jpeg_processor.py", details["JPEG"], details["COMPLETE"], cores_per_processor)
                 tiff_result = self.start_processor(profile_name, "tiff_processor.py", details["TIFF"], details["COMPLETE"], cores_per_processor)
                 
@@ -380,7 +380,7 @@ class JobManager:
         logging.info(f"Started {active_count} active profiles")
 
     def stop_all_profiles(self):
-        """Stop all running profiles."""
+        """stop all running profiles"""
         stopped_count = 0
         for profile_name in list(self.processes.keys()):
             logging.info(f"Stopping profile: {profile_name}")
@@ -394,53 +394,53 @@ class JobManager:
         logging.info(f"Stopped {stopped_count} profiles")
 
     def update_cores_per_profile(self, profile_name, total_cores):
-        """Update the number of cores allocated to a profile (total cores divided between processors)."""
+        """update cores for a profile (total divided between processors)"""
         if profile_name in self.config['profiles']:
-            # Ensure within allowed range
+            # stay within allowed range
             max_cores = self.get_max_cores_per_profile()
             total_cores = max(2, min(total_cores, max_cores))
             
-            # Calculate cores per processor (total divided by 2)
+            # split between processors
             cores_per_processor = total_cores // 2
             
-            # Update in config
+            # update config
             self.config['profiles'][profile_name]['cores_per_processor'] = cores_per_processor
             self.save_config()
             
             logging.info(f"Updated {profile_name} to use {cores_per_processor} cores per processor (total: {total_cores})")
             
-            # If active, restart the profile with new settings
+            # restart if active
             self.update_cores_per_processor(profile_name, cores_per_processor)
             
             return True
         return False
 
     def update_cores_per_processor(self, profile_name, cores_per_processor):
-        """Update the cores_per_processor setting for a specific profile."""
+        """update cores_per_processor setting for a profile"""
         try:
             if profile_name in self.config['profiles']:
-                # Ensure cores_per_processor is at least 1
+                # enforce minimum
                 cores_per_processor = max(1, cores_per_processor)
                 
-                # Update the cores_per_processor setting in the profile
+                # update setting
                 self.config['profiles'][profile_name]['cores_per_processor'] = cores_per_processor
                 
-                # Save the configuration
+                # save config
                 self.save_config()
                 
                 logging.info(f"Updated {profile_name} to use {cores_per_processor} cores per processor")
                 
-                # Restart the profile if it's active
+                # restart if active
                 if self.config['profiles'][profile_name].get('status') == 'Active':
                     logging.info(f"Restarting {profile_name} to apply core changes")
                     self.stop_processor(profile_name)
                     
-                    # Get paths from profile
+                    # get paths from profile
                     jpeg_path = self.config['profiles'][profile_name].get('JPEG', '')
                     tiff_path = self.config['profiles'][profile_name].get('TIFF', '')
                     complete_path = self.config['profiles'][profile_name].get('COMPLETE', '')
                     
-                    # Restart with new core settings
+                    # restart with new settings
                     self.start_processor(profile_name, "jpeg_processor.py", jpeg_path, complete_path, cores_per_processor)
                     self.start_processor(profile_name, "tiff_processor.py", tiff_path, complete_path, cores_per_processor)
                     
