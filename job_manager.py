@@ -328,34 +328,38 @@ class JobManager:
             return None
             
     def stop_processor(self, profile_name):
-        """stop processors for a profile"""
+        """Stop processors for a profile with retries for termination."""
         if profile_name in self.processes:
             for processor_name, process in self.processes[profile_name].items():
                 try:
                     logging.info(f"Stopping {processor_name} for profile {profile_name}")
                     
                     process.terminate()
-                    # give it a chance to exit cleanly
-                    for i in range(10):
-                        if process.poll() is not None:
-                            logging.info(f"Process terminated normally after {(i+1)*0.5} seconds")
+                    retries = 0
+                    max_retries = 10  # max retries (10, 0.5 seconds in between)
+
+                    # wait to terminate 
+                    while retries < max_retries:
+                        if process.poll() is not None:  # check 
+                            logging.info(f"Process {processor_name} terminated successfully after {retries * 0.5} seconds")
                             break
                         time.sleep(0.5)
+                        retries += 1
                     
                     # force kill if still running
                     if process.poll() is None:
-                        logging.info(f"Process did not terminate gracefully, force killing...")
+                        logging.warning(f"Process {processor_name} did not terminate gracefully, force killing...")
                         if sys.platform == 'win32':
                             subprocess.call(['taskkill', '/F', '/T', '/PID', str(process.pid)])
                         else:
                             os.kill(process.pid, 9)
-                            
-                    logging.info(f"Terminated {processor_name} for profile {profile_name}")
+                        logging.info(f"Force killed {processor_name} for profile {profile_name}")
+                    
                 except Exception as e:
                     logging.error(f"Error terminating {processor_name} for profile {profile_name}: {e}")
                     logging.error(traceback.format_exc())
             
-            # cleanup process dictionary
+            # clean up
             del self.processes[profile_name]
 
     def start_all_profiles(self):
