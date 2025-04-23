@@ -7,6 +7,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import fitz  # PyMuPDF
 from PIL import Image, ImageFile
+import numpy as np  # Add this import
 import argparse
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -79,7 +80,7 @@ class PDFProcessor:
                     logging.warning(f"Failed to remove file {file_path}: {str(e)}")
 
     def _convert_page(self, page, output_path):
-        """convert one pdf page to TIFF with group4 compression"""
+        """convert one pdf page to TIFF with adaptive thresholding and group4 compression"""
         temp_png = None
         try:
             # create temp file for intermediate png
@@ -97,10 +98,36 @@ class PDFProcessor:
             if not os.path.exists(temp_png) or os.path.getsize(temp_png) == 0:
                 raise ValueError(f"Failed to create temporary PNG file: {temp_png}")
             
-            # convert to TIFF using PIL for compression settings
+            # load image with PIL for adaptive thresholding
             with Image.open(temp_png) as img:
-                # convert to binary for group4 compression
-                binary_img = img.convert("L").point(lambda x: 0 if x < 128 else 255, '1')
+                # convert to grayscale
+                gray_img = img.convert("L")
+                
+                # apply adaptive thresholding
+                img_array = np.array(gray_img)
+                h, w = img_array.shape
+                binary = np.zeros_like(img_array)
+                
+                # process in blocks for speed
+                block_size = 15  # local region size
+                c = 5  # constant subtracted from mean (controls threshold sensitivity)
+                step = max(1, block_size // 2)
+                
+                for i in range(0, h, step):
+                    for j in range(0, w, step):
+                        # define block region
+                        i_end = min(i + block_size, h)
+                        j_end = min(j + block_size, w)
+                        block = img_array[i:i_end, j:j_end]
+                        
+                        # calculate threshold for this block
+                        threshold = np.mean(block) - c
+                        
+                        # apply threshold to the block
+                        binary[i:i_end, j:j_end] = np.where(block < threshold, 0, 255)
+                
+                # convert back to PIL image and ensure 1-bit mode for Group 4
+                binary_img = Image.fromarray(binary.astype(np.uint8)).convert('1')
                 
                 # save with group4 compression
                 binary_img.save(
@@ -127,14 +154,39 @@ class PDFProcessor:
                 self._safe_remove(temp_png)
 
     def _convert_jpeg_to_tiff(self, jpeg_path, output_path):
-        """convert a jpeg file to tiff with group4 compression"""
+        """convert a jpeg file to tiff using adaptive thresholding with group4 compression"""
         try:
             with Image.open(jpeg_path) as img:
-                # convert to grayscale first
+                # convert to grayscale
                 gray_img = img.convert("L")
-                # make it binary (black and white only)
-                binary_img = gray_img.point(lambda x: 0 if x < 128 else 255, '1')
-                # save as TIFF with group4
+                
+                # apply adaptive thresholding
+                img_array = np.array(gray_img)
+                h, w = img_array.shape
+                binary = np.zeros_like(img_array)
+                
+                # process in blocks for speed
+                block_size = 15  # local region size
+                c = 5  # constant subtracted from mean
+                step = max(1, block_size // 2)
+                
+                for i in range(0, h, step):
+                    for j in range(0, w, step):
+                        # define block region
+                        i_end = min(i + block_size, h)
+                        j_end = min(j + block_size, w)
+                        block = img_array[i:i_end, j:j_end]
+                        
+                        # calculate threshold for this block
+                        threshold = np.mean(block) - c
+                        
+                        # apply threshold to the block
+                        binary[i:i_end, j:j_end] = np.where(block < threshold, 0, 255)
+                
+                # convert back to PIL image in 1-bit mode
+                binary_img = Image.fromarray(binary.astype(np.uint8)).convert('1')
+                
+                # save with group4 compression
                 binary_img.save(
                     output_path, 
                     "TIFF", 
@@ -152,7 +204,7 @@ class PDFProcessor:
             if os.path.exists(output_path):
                 self._safe_remove(output_path)
             return False
-
+        
     def process_jpeg(self, jpeg_path):
         """process a single jpeg file to tiff"""
         try:
