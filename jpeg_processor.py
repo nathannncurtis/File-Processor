@@ -36,6 +36,184 @@ logging.basicConfig(
     ]
 )
 
+def is_file_stable(file_path, min_wait_time=5, check_interval=1, max_checks=30):
+    """check if a file has finished transferring by watching size and mtime"""
+    if not os.path.exists(file_path):
+        logging.warning(f"file does not exist: {file_path}")
+        return False
+        
+    # get initial state
+    try:
+        initial_size = os.path.getsize(file_path)
+        initial_mtime = os.path.getmtime(file_path)
+    except Exception as e:
+        logging.warning(f"can't access file {file_path}: {str(e)}")
+        return False
+    
+    # wait minimum time first
+    logging.info(f"waiting minimum {min_wait_time} seconds for file stability: {file_path}")
+    time.sleep(min_wait_time)
+    
+    # check if changed after min wait
+    try:
+        current_size = os.path.getsize(file_path)
+        current_mtime = os.path.getmtime(file_path)
+        
+        if current_size == initial_size and current_mtime == initial_mtime:
+            # one extra check to be sure
+            time.sleep(check_interval)
+            final_size = os.path.getsize(file_path)
+            final_mtime = os.path.getmtime(file_path)
+            
+            if final_size == current_size and final_mtime == current_mtime:
+                logging.info(f"file {file_path} is stable after min wait")
+                return True
+    except Exception as e:
+        logging.warning(f"can't check file during stability check: {str(e)}")
+        return False
+    
+    # keep checking if still changing
+    prev_size = current_size
+    prev_mtime = current_mtime
+    stable_count = 0
+    needed_stable_checks = 3  # need 3 stable checks in a row
+    
+    for _ in range(max_checks):
+        time.sleep(check_interval)
+        
+        try:
+            current_size = os.path.getsize(file_path)
+            current_mtime = os.path.getmtime(file_path)
+            
+            if current_size == prev_size and current_mtime == prev_mtime:
+                stable_count += 1
+                logging.debug(f"file stable check {stable_count}/{needed_stable_checks}")
+                
+                if stable_count >= needed_stable_checks:
+                    logging.info(f"file {file_path} is stable after {stable_count} checks")
+                    return True
+            else:
+                # reset counter if changes
+                logging.debug(f"file still changing: {file_path}")
+                stable_count = 0
+                prev_size = current_size
+                prev_mtime = current_mtime
+                
+        except Exception as e:
+            logging.warning(f"can't check file stability: {str(e)}")
+            return False
+    
+    logging.warning(f"file {file_path} not stable after {max_checks} checks")
+    return False
+
+def is_folder_stable(folder_path, min_wait_time=5, check_interval=1, max_checks=30):
+    """check if a folder and all files have finished transferring"""
+    if not os.path.exists(folder_path):
+        logging.warning(f"folder does not exist: {folder_path}")
+        return False
+    
+    logging.info(f"checking stability for folder: {folder_path}")
+    
+    # wait minimum time first
+    logging.info(f"waiting minimum {min_wait_time} seconds before folder stability check")
+    time.sleep(min_wait_time)
+    
+    # get initial state
+    try:
+        initial_state = _get_folder_state(folder_path)
+        if initial_state is None:
+            return False
+    except Exception as e:
+        logging.error(f"error getting folder state: {str(e)}")
+        return False
+    
+    # check for stability
+    stable_count = 0
+    needed_stable_checks = 3  # need 3 stable checks in a row
+    prev_state = initial_state
+    
+    for _ in range(max_checks):
+        time.sleep(check_interval)
+        
+        try:
+            current_state = _get_folder_state(folder_path)
+            if current_state is None:
+                return False
+                
+            if _states_equal(prev_state, current_state):
+                stable_count += 1
+                logging.debug(f"folder stable check {stable_count}/{needed_stable_checks}")
+                
+                if stable_count >= needed_stable_checks:
+                    logging.info(f"folder {folder_path} is stable after {stable_count} checks")
+                    return True
+            else:
+                # reset if folder changes
+                logging.debug(f"folder still changing: {folder_path}")
+                stable_count = 0
+                prev_state = current_state
+                
+        except Exception as e:
+            logging.error(f"error checking folder stability: {str(e)}")
+            return False
+    
+    logging.warning(f"folder {folder_path} not stable after {max_checks} checks")
+    return False
+
+def _get_folder_state(folder_path):
+    """get folder state with files, sizes, and mtimes"""
+    try:
+        if not os.path.exists(folder_path):
+            logging.warning(f"folder does not exist: {folder_path}")
+            return None
+            
+        state = {
+            'files': {},
+            'total_size': 0,
+            'count': 0,
+        }
+        
+        for root, _, files in os.walk(folder_path):
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                try:
+                    size = os.path.getsize(file_path)
+                    mtime = os.path.getmtime(file_path)
+                    state['files'][file_path] = {
+                        'size': size,
+                        'mtime': mtime
+                    }
+                    state['total_size'] += size
+                    state['count'] += 1
+                except Exception as e:
+                    logging.warning(f"can't check file {file_path}: {str(e)}")
+        
+        return state
+    except Exception as e:
+        logging.error(f"error getting folder state: {str(e)}")
+        return None
+
+def _states_equal(state1, state2):
+    """compare folder states to see if identical"""
+    if state1 is None or state2 is None:
+        return False
+        
+    # check basic stats
+    if (state1['count'] != state2['count'] or
+        state1['total_size'] != state2['total_size']):
+        return False
+        
+    # check all files same with same sizes and mtimes
+    if set(state1['files'].keys()) != set(state2['files'].keys()):
+        return False
+        
+    for path, info1 in state1['files'].items():
+        info2 = state2['files'].get(path)
+        if info2 is None or info1['size'] != info2['size'] or info1['mtime'] != info2['mtime']:
+            return False
+            
+    return True
+
 def parse_args():
     parser = argparse.ArgumentParser(description="JPEG Processor")
     parser.add_argument('--watch-dir', required=True, help='Directory to watch for new folders containing PDFs')
@@ -93,7 +271,12 @@ class PDFProcessor:
         converted_pages = []
         
         try:
+            # check if pdf is stable before opening
+            if not is_file_stable(pdf_path, min_wait_time=5, check_interval=1, max_checks=30):
+                logging.warning(f"pdf file {pdf_path} not stable after waiting, trying anyway")
+            
             # open the pdf
+            logging.info(f"opening pdf file: {pdf_path}")
             doc = fitz.open(pdf_path)
             total_pages = len(doc)
             logging.info(f"Processing {total_pages} pages in PDF: {pdf_path}")
@@ -164,6 +347,10 @@ class PDFProcessor:
             if not os.path.exists(folder_path):
                 logging.error(f"Folder does not exist: {folder_path}")
                 return False
+            
+            # check folder stability
+            if not is_folder_stable(folder_path, min_wait_time=5, check_interval=1, max_checks=30):
+                logging.warning(f"folder {folder_path} not stable after waiting, trying anyway")
                 
             # get all files
             files = os.listdir(folder_path)
@@ -250,16 +437,21 @@ class FolderWatcher(FileSystemEventHandler):
                 
             logging.info(f"New folder detected: {folder_path}")
             
-            # wait for folder to finish being created
-            time.sleep(2)
-            
-            # mark as processing
+            # add to processing set right away
             self.processing_set.add(folder_path)
             
             try:
+                # check stability before processing
+                if not is_folder_stable(folder_path, min_wait_time=5, check_interval=1, max_checks=30):
+                    logging.warning(f"folder {folder_path} not stable after waiting, trying anyway")
+                
+                # process the folder
                 self.processor.process_folder(folder_path)
+            except Exception as e:
+                logging.error(f"error processing folder {folder_path}: {e}")
+                logging.error(traceback.format_exc())
             finally:
-                # always remove from processing set
+                # always clean up processing set
                 self.processing_set.discard(folder_path)
 
 def main():
