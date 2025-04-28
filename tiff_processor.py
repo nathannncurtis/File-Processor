@@ -28,48 +28,47 @@ logging.basicConfig(
     ]
 )
 
-def is_folder_stable(folder_path):
+def check_folder_stability(folder_path):
     """
-    simple folder stability check - wait 5 seconds and see if it changed
+    Check if folder is stable - wait 5 seconds and see if it changed.
+    Keeps retrying immediately until stable.
     """
     if not os.path.exists(folder_path):
+        logging.warning(f"Folder does not exist: {folder_path}")
         return False
         
-    logging.info(f"checking folder stability for {folder_path}")
-    
-    # get initial state
-    try:
-        initial_files = os.listdir(folder_path)
-        initial_size = sum(os.path.getsize(os.path.join(folder_path, f)) 
-                          for f in initial_files if os.path.isfile(os.path.join(folder_path, f)))
-    except Exception as e:
-        logging.error(f"error checking folder: {str(e)}")
-        return False
-    
-    # wait 5 seconds
-    logging.info(f"waiting 5 seconds for folder stability")
-    time.sleep(5)
-    
-    # check if folder changed
-    try:
-        if not os.path.exists(folder_path):
-            return False
+    while True:  # keep checking until stable
+        # get initial state
+        try:
+            initial_files = os.listdir(folder_path)
+            initial_size = sum(os.path.getsize(os.path.join(folder_path, f)) 
+                            for f in initial_files if os.path.isfile(os.path.join(folder_path, f)))
             
-        current_files = os.listdir(folder_path)
-        current_size = sum(os.path.getsize(os.path.join(folder_path, f)) 
-                          for f in current_files if os.path.isfile(os.path.join(folder_path, f)))
-        
-        if len(initial_files) != len(current_files) or initial_size != current_size:
-            # changed, not stable
-            logging.info(f"folder still changing, will retry later")
+            # wait 5 seconds
+            logging.info(f"Waiting 5 seconds for folder stability: {folder_path}")
+            time.sleep(5)
+            
+            # check if folder changed
+            if not os.path.exists(folder_path):
+                logging.warning(f"Folder disappeared during stability check: {folder_path}")
+                return False
+                
+            current_files = os.listdir(folder_path)
+            current_size = sum(os.path.getsize(os.path.join(folder_path, f)) 
+                            for f in current_files if os.path.isfile(os.path.join(folder_path, f)))
+            
+            if len(initial_files) != len(current_files) or initial_size != current_size:
+                # changed - immediately try again
+                logging.info(f"Folder still changing, retrying stability check immediately...")
+                continue
+            else:
+                # unchanged, stable
+                logging.info(f"Folder is stable, proceeding with processing")
+                return True
+                
+        except Exception as e:
+            logging.error(f"Error checking folder stability: {str(e)}")
             return False
-        else:
-            # unchanged, stable
-            logging.info(f"folder is stable")
-            return True
-    except Exception as e:
-        logging.error(f"error checking folder stability: {str(e)}")
-        return False
 
 def parse_args():
     parser = argparse.ArgumentParser(description="TIFF Processor for PDFs and JPEGs")
@@ -87,6 +86,7 @@ class PDFProcessor:
         self.success_count = 0
         self.failure_count = 0
         self.processed_folders = set()  # track folders we've already processed
+        self.stable_folders = set()  # track folders that have been verified as stable
         self.lock = threading.Lock()  # lock for thread-safe operations
 
     def _validate_tiff(self, file_path):
@@ -381,6 +381,29 @@ class PDFProcessor:
                 logging.info(f"Folder no longer exists: {folder_path}")
                 return False
                 
+            # verify folder is still stable (if it was marked stable before)
+            if folder_path in self.stable_folders:
+                # quick check to confirm nothing changed
+                try:
+                    current_files = os.listdir(folder_path)
+                    folder_check_passed = True
+                except Exception:
+                    folder_check_passed = False
+                    
+                if not folder_check_passed:
+                    # folder changed or disappeared, remove from stable set
+                    self.stable_folders.discard(folder_path)
+                    logging.info(f"Folder changed since stability check, will need to recheck")
+                    
+            # check stability if not already verified
+            if folder_path not in self.stable_folders:
+                if not check_folder_stability(folder_path):
+                    logging.warning(f"Folder couldn't be verified as stable: {folder_path}")
+                    return False
+                # mark as stable once verified
+                self.stable_folders.add(folder_path)
+                logging.info(f"Folder verified as stable: {folder_path}")
+                
             # see if there's anything to process
             pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.pdf')]
             jpeg_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.jpg', '.jpeg'))]
@@ -400,10 +423,6 @@ class PDFProcessor:
             if folder_path in self.processed_folders:
                 logging.info(f"Folder previously processed but contains new files: {folder_path}")
                 self.processed_folders.remove(folder_path)
-            
-            # make sure folder isn't still being written to
-            if not self._is_folder_stable(folder_path):
-                return False
 
             # process pdfs
             pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.pdf')]
@@ -440,53 +459,15 @@ class PDFProcessor:
                 self._move_folder(folder_path)
                 self.processed_folders.add(folder_path)
                 
+            # remove from stable folders after processing
+            self.stable_folders.discard(folder_path)
+                
             return all_successful
 
         except Exception as e:
             logging.error(f"Folder processing failed: {str(e)}")
             return False
 
-    def _is_folder_stable(self, folder_path, timeout=30, check_interval=2):
-        """check if folder is done changing before processing"""
-        logging.info(f"Verifying folder stability: {folder_path}")
-        try:
-            initial_state = None
-            start_time = time.time()
-
-            while time.time() - start_time < timeout:
-                if not os.path.exists(folder_path):
-                    logging.warning(f"Folder no longer exists: {folder_path}")
-                    return False
-
-                current_state = self._get_folder_state(folder_path)
-                if current_state == initial_state and current_state is not None:
-                    return True
-                initial_state = current_state
-                time.sleep(check_interval)
-
-            logging.warning(f"Folder not stable after {timeout} seconds, processing anyway")
-            return True  # process anyway after timeout
-        except Exception as e:
-            logging.error(f"Stability check failed: {str(e)}")
-            return False
-
-    def _get_folder_state(self, folder_path):
-        """get folder state info to check if it's changing"""
-        try:
-            if not os.path.exists(folder_path):
-                raise FileNotFoundError(f"Folder not found: {folder_path}")
-
-            files = os.listdir(folder_path)
-            return {
-                'file_count': len(files),
-                'file_list': sorted(files),
-                'total_size': sum(os.path.getsize(os.path.join(folder_path, f)) 
-                                for f in files if os.path.isfile(os.path.join(folder_path, f)))
-            }
-        except Exception as e:
-            logging.error(f"Failed to get folder state: {str(e)}")
-            return None
-        
     def _safe_remove_with_retries(self, file_path, max_retries=5, retry_delay=2):
         """try harder to remove a file with more retries and delay"""
         if not os.path.exists(file_path):
@@ -626,12 +607,15 @@ class FolderHandler(FileSystemEventHandler):
             self.processing_set.add(folder_path)
             
             try:
-                # simple 5-second stability check
-                if not is_folder_stable(folder_path):
-                    # not stable yet, will be caught by modified event later
-                    logging.info(f"folder {folder_path} not stable yet, skipping for now")
-                    self.processing_set.discard(folder_path)
-                    return
+                # run stability check if needed (will retry until stable)
+                if folder_path not in self.processor.stable_folders:
+                    if not check_folder_stability(folder_path):
+                        logging.warning(f"Failed to verify folder stability: {folder_path}")
+                        self.processing_set.discard(folder_path)
+                        return
+                    # mark as stable
+                    self.processor.stable_folders.add(folder_path)
+                    logging.info(f"Folder verified as stable and queued: {folder_path}")
                 
                 # reset if folder gets recreated
                 if folder_path in self.processor.processed_folders:
@@ -655,8 +639,6 @@ class FolderHandler(FileSystemEventHandler):
                 logging.info(f"folder already being processed: {folder_path}")
                 return
                 
-            logging.info(f"Folder modified: {folder_path}")
-            
             # check if it contains files we process
             try:
                 if not os.path.exists(folder_path):
@@ -666,23 +648,29 @@ class FolderHandler(FileSystemEventHandler):
                 jpeg_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.jpg', '.jpeg'))]
                 
                 if not pdf_files and not jpeg_files:
-                    logging.info(f"Folder modified but contains no processable files: {folder_path}")
                     return
             except Exception as e:
                 logging.error(f"Error checking folder contents: {str(e)}")
                 return
+                
+            logging.info(f"Folder modified with processable files: {folder_path}")
             
             # add to processing set
             self.processing_set.add(folder_path)
             
             try:
-                # simple 5-second stability check
-                if not is_folder_stable(folder_path):
-                    # not stable yet, we'll catch it on next modification
-                    logging.info(f"folder {folder_path} not stable yet, skipping for now")
+                # remove from stable folders if it was previously marked stable
+                self.processor.stable_folders.discard(folder_path)
+                
+                # check stability (will retry until stable)
+                if not check_folder_stability(folder_path):
+                    logging.warning(f"Failed to verify folder stability after modification: {folder_path}")
                     self.processing_set.discard(folder_path)
                     return
-                    
+                
+                # mark as stable
+                self.processor.stable_folders.add(folder_path)
+                
                 # reset if folder is modified with new files
                 if folder_path in self.processor.processed_folders:
                     self.processor.processed_folders.remove(folder_path)
