@@ -3,6 +3,7 @@ import sys
 import time
 import shutil
 import threading
+import platform
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import fitz  # PyMuPDF
@@ -11,7 +12,7 @@ import numpy as np
 import cv2
 import argparse
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc # for garbage collection
 import traceback
 
@@ -88,6 +89,8 @@ class PDFProcessor:
         self.processed_folders = set()  # track folders we've already processed
         self.stable_folders = set()  # track folders that have been verified as stable
         self.lock = threading.Lock()  # lock for thread-safe operations
+        self.file_locks = {}  # for per-PDF locks
+        self.folder_locks = {}  # for per-folder locks
 
     def _validate_tiff(self, file_path):
         """check if tiff file is valid and can be opened"""
@@ -99,7 +102,7 @@ class PDFProcessor:
                 
             # try opening the file to make sure it's usable
             with Image.open(file_path) as img:
-                img.load()  # force load to catch any issues
+                img.verify()  # verify instead of load to catch corrupted data
                 # make sure it's actually a tiff
                 if img.format != "TIFF":
                     logging.error(f"File {file_path} is not a valid TIFF format")
@@ -137,31 +140,76 @@ class PDFProcessor:
             # generate pixmap with our dpi settings
             pix = page.get_pixmap(dpi=self.dpi, alpha=False)
             
-            # save as png first - easier to work with
-            pix.pil_save(temp_png, format="PNG")
-            
-            # check temp file was created properly
-            if not os.path.exists(temp_png) or os.path.getsize(temp_png) == 0:
-                raise ValueError(f"Failed to create temporary PNG file: {temp_png}")
-            
-            # use opencv for fast adaptive thresholding
-            # read image with opencv (grayscale mode)
-            img = cv2.imread(temp_png, cv2.IMREAD_GRAYSCALE)
-            if img is None:
-                raise ValueError(f"Failed to load image with OpenCV: {temp_png}")
+            # save as png using memory buffer to avoid file I/O when possible
+            try:
+                # Try the memory buffer approach first
+                img_data = pix.tobytes("png")
+                nparr = np.frombuffer(img_data, np.uint8)
+                img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
                 
-            # apply adaptive thresholding (much faster than numpy version)
-            binary = cv2.adaptiveThreshold(
-                img, 
-                255,  # max value
-                cv2.ADAPTIVE_THRESH_MEAN_C,  # mean thresholding
-                cv2.THRESH_BINARY,  # binary output
-                15,  # block size (keep same as before, must be odd)
-                5    # c value - constant subtracted from mean
-            )
+                # Explicitly release pixmap memory
+                pix = None
+                
+                # Ensure we got a valid image
+                if img is None:
+                    raise ValueError("Failed to decode image from memory buffer")
+            except Exception:
+                # Fall back to file-based approach if memory buffer fails
+                pix.pil_save(temp_png, format="PNG")
+                
+                # Explicitly release pixmap memory
+                pix = None
+                
+                # Force garbage collection after releasing pixmap
+                gc.collect()
+                
+                # Wait briefly to ensure file is fully written
+                time.sleep(0.1)
+                
+                # Check temp file was created properly
+                if not os.path.exists(temp_png) or os.path.getsize(temp_png) == 0:
+                    raise ValueError(f"Failed to create temporary PNG file: {temp_png}")
+                
+                # Read with OpenCV
+                img = cv2.imread(temp_png, cv2.IMREAD_GRAYSCALE)
+                
+            if img is None:
+                raise ValueError(f"Failed to load image: Memory buffer and file approaches both failed")
+                
+            # Check if the page is predominantly dark
+            # Calculate average brightness of the image
+            avg_brightness = np.mean(img)
+            is_dark_page = avg_brightness < 50  # threshold for considering a page "dark"
+            
+            if is_dark_page:
+                logging.info(f"Detected predominantly dark page, using special processing")
+                # For dark pages, use global thresholding instead of adaptive
+                # This preserves the black background while still capturing any light content
+                _, binary = cv2.threshold(
+                    img,
+                    40,  # threshold value, pixels below this become black (0)
+                    255,  # max value for pixels above threshold
+                    cv2.THRESH_BINARY  # binary output
+                )
+            else:
+                # For normal pages, use adaptive thresholding as before
+                binary = cv2.adaptiveThreshold(
+                    img, 
+                    255,  # max value
+                    cv2.ADAPTIVE_THRESH_MEAN_C,  # mean thresholding
+                    cv2.THRESH_BINARY,  # binary output
+                    15,  # block size (keep same as before, must be odd)
+                    5    # c value - constant subtracted from mean
+                )
+            
+            # Free memory for the original image
+            img = None
             
             # convert to pil for saving with group 4 compression
             binary_img = Image.fromarray(binary).convert('1')
+            
+            # Free memory for the binary array
+            binary = None
             
             # save with group4 compression
             binary_img.save(
@@ -170,6 +218,12 @@ class PDFProcessor:
                 compression="group4", 
                 dpi=(self.dpi, self.dpi)
             )
+            
+            # Free memory for the PIL image
+            binary_img = None
+            
+            # Force garbage collection after processing
+            gc.collect()
             
             # verify the tiff is good
             if not self._validate_tiff(output_path):
@@ -195,18 +249,38 @@ class PDFProcessor:
             if img is None:
                 raise ValueError(f"Failed to load image with OpenCV: {jpeg_path}")
             
-            # apply adaptive thresholding (much faster implementation)
-            binary = cv2.adaptiveThreshold(
-                img,
-                255,  # max value
-                cv2.ADAPTIVE_THRESH_MEAN_C,  # mean thresholding
-                cv2.THRESH_BINARY,  # binary output
-                15,  # block size (must be odd)
-                5    # c value - constant subtracted from mean
-            )
+            # Check if the image is predominantly dark
+            avg_brightness = np.mean(img)
+            is_dark_image = avg_brightness < 50  # threshold for considering an image "dark"
+            
+            if is_dark_image:
+                logging.info(f"Detected predominantly dark JPEG, using special processing")
+                # For dark images, use global thresholding instead of adaptive
+                _, binary = cv2.threshold(
+                    img,
+                    40,  # threshold value
+                    255,  # max value
+                    cv2.THRESH_BINARY  # binary output
+                )
+            else:
+                # For normal images, use adaptive thresholding as before
+                binary = cv2.adaptiveThreshold(
+                    img,
+                    255,  # max value
+                    cv2.ADAPTIVE_THRESH_MEAN_C,  # mean thresholding
+                    cv2.THRESH_BINARY,  # binary output
+                    15,  # block size (must be odd)
+                    5    # c value - constant subtracted from mean
+                )
+            
+            # Free memory for original image
+            img = None
             
             # convert to pil for saving with group 4
             binary_img = Image.fromarray(binary).convert('1')
+            
+            # Free memory for binary array
+            binary = None
             
             # save with group4 compression
             binary_img.save(
@@ -215,6 +289,12 @@ class PDFProcessor:
                 compression="group4", 
                 dpi=(self.dpi, self.dpi)
             )
+            
+            # Free memory for PIL image
+            binary_img = None
+            
+            # Force garbage collection
+            gc.collect()
             
             # make sure the tiff is valid
             if not self._validate_tiff(output_path):
@@ -233,17 +313,17 @@ class PDFProcessor:
             logging.info(f"processing jpeg: {jpeg_path}")
             
             # setup output path
-            base_name = os.path.splitext(os.path.basename(jpeg_path))[0]
-            output_dir = os.path.dirname(jpeg_path)
-            output_path = os.path.join(output_dir, f"{base_name}.tif")
+            output_path = jpeg_path.rsplit('.', 1)[0] + '.tif'
             
-            # try conversion with retries
-            max_retries = 5
+            # infinite retry loop - never give up
+            attempt = 0
             success = False
             
-            for retry in range(max_retries):
-                if retry > 0:
-                    logging.info(f"retry attempt {retry} for jpeg: {jpeg_path}")
+            while not success:
+                attempt += 1
+                if attempt > 1:
+                    logging.warning(f"retry attempt {attempt} for jpeg: {jpeg_path}")
+                    time.sleep(1)  # pause before retry
                     
                 try:
                     success = self._convert_jpeg_to_tiff(jpeg_path, output_path)
@@ -252,221 +332,172 @@ class PDFProcessor:
                     if success and os.path.exists(output_path) and self._validate_tiff(output_path):
                         # conversion worked, break out of retry loop
                         break
-                    else:
-                        # sleep briefly before retrying
-                        time.sleep(1)
                 except Exception as e:
-                    logging.error(f"attempt {retry+1} failed: {str(e)}")
-                    # sleep before retry
-                    time.sleep(1)
+                    logging.error(f"attempt {attempt} failed: {str(e)}")
+                    time.sleep(1)  # sleep before retry
             
-            # after all retries, check final status
-            if success and os.path.exists(output_path) and self._validate_tiff(output_path):
-                # conversion succeeded
+            # conversion succeeded
+            with self.lock:
                 self.success_count += 1
-                logging.info(f"successfully converted jpeg: {jpeg_path}")
-                self._safe_remove(jpeg_path)
-                return True
-            else:
-                # all retries failed - this is an unrecoverable error
-                self.failure_count += 1
-                logging.error(f"CRITICAL ERROR: all conversion attempts failed for jpeg: {jpeg_path}")
-                # don't delete original (though we'll never move the folder so it will get retried later)
-                return False
+            logging.info(f"successfully converted jpeg: {jpeg_path}")
+            self._safe_remove(jpeg_path)
+            return True
                     
         except Exception as e:
-            self.failure_count += 1
+            with self.lock:
+                self.failure_count += 1
             logging.error(f"CRITICAL ERROR: jpeg processing failed for {jpeg_path}: {str(e)}")
             return False
 
-    def process_pdf(self, pdf_path):
-        """convert pdf file to tiff files - must convert ALL pages"""
-        success = True
-        created_files = []
-        doc = None
+    def _convert_page_with_retries(self, page, output_path, page_num, total_pages):
+        """Process a single page with infinite retries"""
+        attempt = 0
         
-        try:
-            # open the pdf file
-            doc = fitz.open(pdf_path)
-            total_pages = len(doc)
-            base_name = os.path.splitext(os.path.basename(pdf_path))[0]
-            output_dir = os.path.dirname(pdf_path)
-
-            logging.info(f"processing pdf: {pdf_path} ({total_pages} pages)")
+        # infinite retry loop - never give up on a page
+        while True:
+            attempt += 1
+            if attempt > 1:
+                logging.warning(f"retry attempt {attempt} for page {page_num} of {total_pages}")
+                time.sleep(1)  # brief pause before retry
             
-            # track page conversion status
-            all_pages_converted = True
-            
-            # process each page with retries if needed
-            for page_num in range(total_pages):
-                output_path = os.path.join(output_dir, f"{base_name}_page_{page_num+1:04d}.tif")
-                page_success = False
+            try:
+                # process the page
+                page_success = self._convert_page(page, output_path)
                 
-                # try up to 5 times for each page
-                max_retries = 5
-                for retry in range(max_retries):
-                    if retry > 0:
-                        logging.info(f"retry attempt {retry} for page {page_num+1}")
-                    
-                    try:
-                        # use lock for thread safety
-                        with self.lock:
-                            # process the page
-                            page_success = self._convert_page(doc[page_num], output_path)
-                            
-                            if page_success and os.path.exists(output_path) and self._validate_tiff(output_path):
-                                # page converted successfully
-                                created_files.append(output_path)
-                                self.success_count += 1
-                                logging.info(f"successfully converted page {page_num+1} of {total_pages}")
-                                break  # exit retry loop
-                            else:
-                                # failed this attempt, will retry
-                                logging.warning(f"failed attempt {retry+1} for page {page_num+1}")
-                                time.sleep(1)  # brief pause before retry
-                    except Exception as e:
-                        logging.error(f"error on attempt {retry+1} for page {page_num+1}: {str(e)}")
-                        time.sleep(1)  # brief pause before retry
-                
-                # after all retries, check if we succeeded with this page
-                if not page_success or not os.path.exists(output_path) or not self._validate_tiff(output_path):
-                    all_pages_converted = False
-                    logging.error(f"CRITICAL ERROR: all conversion attempts failed for page {page_num+1}")
-                    self.failure_count += 1
-            
-            # close the document to release file handles
-            if doc:
-                doc.close()
-                doc = None  # Explicitly set to None
-            
-            # force garbage collection to help release handles
-            gc.collect()
-            
-            # final status check
-            if all_pages_converted and len(created_files) == total_pages:
-                logging.info(f"all {total_pages} pages of {pdf_path} processed successfully")
-                
-                # Brief pause to ensure file handles are fully released
-                time.sleep(2)
-                
-                # Try delete with additional retries
-                delete_success = self._safe_remove_with_retries(pdf_path, max_retries=5, retry_delay=2)
-                if not delete_success:
-                    logging.warning(f"Could not delete PDF after multiple attempts: {pdf_path}")
-                    
-                return True
-            else:
-                # some pages failed, don't delete the PDF but also don't consider this a success
-                logging.error(f"CRITICAL ERROR: Not all pages converted for {pdf_path}, original preserved")
-                return False
-                
-        except Exception as e:
-            success = False
-            logging.error(f"CRITICAL ERROR: pdf processing failed for {pdf_path}: {str(e)}")
-            return False
-                
-        finally:
-            # always close the pdf to avoid memory leaks
-            if doc:
-                try:
-                    doc.close()
-                except Exception as e:
-                    logging.warning(f"error closing pdf document: {str(e)}")
-                    
-    def process_folder(self, folder_path):
-        """process all pdfs and jpegs in a folder"""
-        try:
-            # check folder still exists
-            if not os.path.exists(folder_path):
-                logging.info(f"Folder no longer exists: {folder_path}")
-                return False
-                
-            # verify folder is still stable (if it was marked stable before)
-            if folder_path in self.stable_folders:
-                # quick check to confirm nothing changed
-                try:
-                    current_files = os.listdir(folder_path)
-                    folder_check_passed = True
-                except Exception:
-                    folder_check_passed = False
-                    
-                if not folder_check_passed:
-                    # folder changed or disappeared, remove from stable set
-                    self.stable_folders.discard(folder_path)
-                    logging.info(f"Folder changed since stability check, will need to recheck")
-                    
-            # check stability if not already verified
-            if folder_path not in self.stable_folders:
-                if not check_folder_stability(folder_path):
-                    logging.warning(f"Folder couldn't be verified as stable: {folder_path}")
-                    return False
-                # mark as stable once verified
-                self.stable_folders.add(folder_path)
-                logging.info(f"Folder verified as stable: {folder_path}")
-                
-            # see if there's anything to process
-            pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.pdf')]
-            jpeg_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.jpg', '.jpeg'))]
-            
-            if not pdf_files and not jpeg_files:
-                # nothing to process
-                if folder_path in self.processed_folders:
-                    logging.info(f"Folder already processed and has no new files: {folder_path}")
+                if page_success and os.path.exists(output_path) and self._validate_tiff(output_path):
+                    # page converted successfully
+                    logging.info(f"successfully converted page {page_num} of {total_pages}")
                     return True
                 else:
-                    logging.info(f"No PDF or JPEG files found in folder: {folder_path}")
-                    self._move_folder(folder_path)
-                    self.processed_folders.add(folder_path)
-                    return True
-            
-            # got files to process
-            if folder_path in self.processed_folders:
-                logging.info(f"Folder previously processed but contains new files: {folder_path}")
-                self.processed_folders.remove(folder_path)
+                    logging.warning(f"failed attempt {attempt} for page {page_num}")
+            except Exception as e:
+                logging.error(f"error on attempt {attempt} for page {page_num}: {str(e)}")
+        
+        # This line should never be reached because the loop only exits with a return
+        return False
 
-            # process pdfs
-            pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.pdf')]
-            pdf_results = []
+    def process_pdf(self, pdf_path):
+        """convert pdf file to tiff files - must convert ALL pages"""
+        # Create file lock if it doesn't exist
+        if pdf_path not in self.file_locks:
+            self.file_locks[pdf_path] = threading.Lock()
             
-            for pdf_file in pdf_files:
-                pdf_path = os.path.join(folder_path, pdf_file)
-                result = self.process_pdf(pdf_path)
-                pdf_results.append(result)
-
-            # process jpegs
-            jpeg_files = [f for f in os.listdir(folder_path) 
-                         if f.lower().endswith(('.jpg', '.jpeg'))]
-            jpeg_results = []
+        # Lock this PDF for exclusive access
+        with self.file_locks[pdf_path]:
+            success = True
+            created_files = []
+            doc = None
             
-            for jpeg_file in jpeg_files:
-                jpeg_path = os.path.join(folder_path, jpeg_file)
-                result = self.process_jpeg(jpeg_path)
-                jpeg_results.append(result)
+            try:
+                # Check file size to determine if memory mapping would be beneficial
+                # (memory parameter will be used differently depending on PyMuPDF version)
+                file_size = os.path.getsize(pdf_path)
+                
+                # open the pdf file - try to use memory mapping if available in this PyMuPDF version
+                try:
+                    # Try with the memory parameter (newer versions of PyMuPDF)
+                    doc = fitz.open(pdf_path, filetype="pdf", memory=file_size > 50_000_000)
+                except TypeError:
+                    # Fallback for older versions that don't support the memory parameter
+                    doc = fitz.open(pdf_path)
+                total_pages = len(doc)
+                digits = len(str(total_pages)) + 1
+                base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+                output_dir = os.path.dirname(pdf_path)
 
-            # move folder if everything worked
-            all_successful = True
-            if pdf_files or jpeg_files:
-                if not all(pdf_results + jpeg_results):
-                    all_successful = False
-                    logging.warning(f"Not all files in {folder_path} were processed successfully")
+                logging.info(f"processing pdf: {pdf_path} ({total_pages} pages)")
+                
+                # Pre-generate output paths for all pages
+                output_paths = [os.path.join(output_dir, f"{base_name}_page_{page_num+1:0{digits}d}.tif") 
+                               for page_num in range(total_pages)]
+                
+                # Process pages in parallel but track results by page number
+                # Choose appropriate number of workers based on CPU cores, but avoid too many
+                max_workers = min(os.cpu_count() or 4, 4)  # Limit to 4 threads max
+                
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    # Map to store futures by page number
+                    page_futures = {}
                     
-                if all_successful:
-                    self._move_folder(folder_path)
-                    self.processed_folders.add(folder_path)  # mark as done
-            else:
-                # empty folders just get moved
-                logging.info(f"No PDF or JPEG files found in {folder_path}")
-                self._move_folder(folder_path)
-                self.processed_folders.add(folder_path)
+                    # Submit all pages for processing
+                    for page_num in range(total_pages):
+                        future = executor.submit(
+                            self._convert_page_with_retries, 
+                            doc[page_num], 
+                            output_paths[page_num], 
+                            page_num + 1, 
+                            total_pages
+                        )
+                        page_futures[future] = (page_num, output_paths[page_num])
+                    
+                    # Collect results as they complete (order doesn't matter here)
+                    for future in as_completed(page_futures):
+                        page_num, output_path = page_futures[future]
+                        try:
+                            page_success = future.result()
+                            if page_success:
+                                created_files.append(output_path)
+                                with self.lock:
+                                    self.success_count += 1
+                            else:
+                                # This should never happen due to infinite retries, but handle it anyway
+                                logging.error(f"Failed to process page {page_num+1} despite retries")
+                                success = False
+                        except Exception as e:
+                            logging.error(f"Error processing page {page_num+1}: {str(e)}")
+                            success = False
                 
-            # remove from stable folders after processing
-            self.stable_folders.discard(folder_path)
+                # close the document to release file handles
+                if doc:
+                    doc.close()
+                    doc = None  # Explicitly set to None
                 
-            return all_successful
-
-        except Exception as e:
-            logging.error(f"Folder processing failed: {str(e)}")
-            return False
+                # force garbage collection to help release handles
+                gc.collect()
+                
+                # More aggressive memory cleanup on Windows
+                if platform.system() == 'Windows':
+                    try:
+                        import ctypes
+                        ctypes.windll.kernel32.SetProcessWorkingSetSize(-1, -1)
+                    except Exception as e:
+                        logging.warning(f"Error freeing memory on Windows: {str(e)}")
+                
+                # final status check - all pages must be converted
+                if len(created_files) == total_pages:
+                    logging.info(f"all {total_pages} pages of {pdf_path} processed successfully")
+                    
+                    # Brief pause to ensure file handles are fully released
+                    time.sleep(2)
+                    
+                    # Try delete with additional retries
+                    delete_success = self._safe_remove_with_retries(pdf_path, max_retries=5, retry_delay=2)
+                    if not delete_success:
+                        logging.warning(f"Could not delete PDF after multiple attempts: {pdf_path}")
+                        
+                    return True
+                else:
+                    # some pages failed, don't delete the PDF but also don't consider this a success
+                    logging.error(f"CRITICAL ERROR: Not all pages converted for {pdf_path}, original preserved")
+                    return False
+                    
+            except Exception as e:
+                success = False
+                with self.lock:
+                    self.failure_count += 1
+                logging.error(f"CRITICAL ERROR: pdf processing failed for {pdf_path}: {str(e)}")
+                return False
+                    
+            finally:
+                # always close the pdf to avoid memory leaks
+                if doc:
+                    try:
+                        doc.close()
+                    except Exception as e:
+                        logging.warning(f"error closing pdf document: {str(e)}")
+                
+                # Force garbage collection after full PDF processing
+                gc.collect()
 
     def _safe_remove_with_retries(self, file_path, max_retries=5, retry_delay=2):
         """try harder to remove a file with more retries and delay"""
@@ -490,6 +521,139 @@ class PDFProcessor:
         
         logging.error(f"Failed to remove file after {max_retries} attempts: {file_path}")
         return False
+
+    def process_folder(self, folder_path):
+        """process all pdfs and jpegs in a folder"""
+        # Create folder lock if it doesn't exist
+        if folder_path not in self.folder_locks:
+            self.folder_locks[folder_path] = threading.Lock()
+            
+        # Lock this folder for exclusive access
+        with self.folder_locks[folder_path]:
+            try:
+                # check folder still exists
+                if not os.path.exists(folder_path):
+                    logging.info(f"Folder no longer exists: {folder_path}")
+                    return False
+                    
+                # verify folder is still stable (if it was marked stable before)
+                if folder_path in self.stable_folders:
+                    # quick check to confirm nothing changed
+                    try:
+                        current_files = os.listdir(folder_path)
+                        folder_check_passed = True
+                    except Exception:
+                        folder_check_passed = False
+                        
+                    if not folder_check_passed:
+                        # folder changed or disappeared, remove from stable set
+                        self.stable_folders.discard(folder_path)
+                        logging.info(f"Folder changed since stability check, will need to recheck")
+                        
+                # check stability if not already verified
+                if folder_path not in self.stable_folders:
+                    if not check_folder_stability(folder_path):
+                        logging.warning(f"Folder couldn't be verified as stable: {folder_path}")
+                        return False
+                    # mark as stable once verified
+                    self.stable_folders.add(folder_path)
+                    logging.info(f"Folder verified as stable: {folder_path}")
+                    
+                # see if there's anything to process
+                pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.pdf')]
+                jpeg_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.jpg', '.jpeg'))]
+                
+                if not pdf_files and not jpeg_files:
+                    # nothing to process
+                    if folder_path in self.processed_folders:
+                        logging.info(f"Folder already processed and has no new files: {folder_path}")
+                        return True
+                    else:
+                        logging.info(f"No PDF or JPEG files found in folder: {folder_path}")
+                        self._move_folder(folder_path)
+                        self.processed_folders.add(folder_path)
+                        return True
+                
+                # got files to process
+                if folder_path in self.processed_folders:
+                    logging.info(f"Folder previously processed but contains new files: {folder_path}")
+                    self.processed_folders.remove(folder_path)
+                
+                # Get updated list of files (in case they changed during stability check)
+                pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.pdf')]
+                pdf_results = []
+                
+                # Process PDFs one by one (each PDF is already processed in parallel internally)
+                for pdf_file in pdf_files:
+                    pdf_path = os.path.join(folder_path, pdf_file)
+                    result = self.process_pdf(pdf_path)
+                    pdf_results.append(result)
+                    
+                    # Force garbage collection after each PDF
+                    gc.collect()
+
+                # Process JPEGs in parallel
+                jpeg_files = [f for f in os.listdir(folder_path) 
+                             if f.lower().endswith(('.jpg', '.jpeg'))]
+                jpeg_results = []
+                
+                # For small numbers of JPEGs, just process them sequentially
+                # For larger batches, process them in parallel
+                if len(jpeg_files) <= 3:
+                    for jpeg_file in jpeg_files:
+                        jpeg_path = os.path.join(folder_path, jpeg_file)
+                        result = self.process_jpeg(jpeg_path)
+                        jpeg_results.append(result)
+                else:
+                    # Use parallel processing for larger batches
+                    max_workers = min(os.cpu_count() or 4, 4)  # Limit to 4 threads max
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        jpeg_paths = [os.path.join(folder_path, jpeg_file) for jpeg_file in jpeg_files]
+                        futures = [executor.submit(self.process_jpeg, jpeg_path) for jpeg_path in jpeg_paths]
+                        
+                        for future in futures:
+                            try:
+                                result = future.result()
+                                jpeg_results.append(result)
+                            except Exception as e:
+                                logging.error(f"Error in JPEG processing: {str(e)}")
+                                jpeg_results.append(False)
+
+                # move folder if everything worked
+                all_successful = True
+                if pdf_files or jpeg_files:
+                    if not all(pdf_results + jpeg_results):
+                        all_successful = False
+                        logging.warning(f"Not all files in {folder_path} were processed successfully")
+                        
+                    if all_successful:
+                        self._move_folder(folder_path)
+                        self.processed_folders.add(folder_path)  # mark as done
+                else:
+                    # empty folders just get moved
+                    logging.info(f"No PDF or JPEG files found in {folder_path}")
+                    self._move_folder(folder_path)
+                    self.processed_folders.add(folder_path)
+                    
+                # remove from stable folders after processing
+                self.stable_folders.discard(folder_path)
+                
+                # Force garbage collection after processing folder
+                gc.collect()
+                
+                # More aggressive memory cleanup on Windows
+                if platform.system() == 'Windows':
+                    try:
+                        import ctypes
+                        ctypes.windll.kernel32.SetProcessWorkingSetSize(-1, -1)
+                    except Exception as e:
+                        logging.warning(f"Error freeing memory on Windows: {str(e)}")
+                    
+                return all_successful
+
+            except Exception as e:
+                logging.error(f"Folder processing failed: {str(e)}")
+                return False
 
     def _move_folder(self, src_folder):
         """move processed folder to output location, merging if destination already exists"""
