@@ -70,6 +70,67 @@ def check_folder_stability(folder_path):
         except Exception as e:
             logging.error(f"Error checking folder stability: {str(e)}")
             return False
+        
+def needs_resizing(image_path, target_width=1700, target_height=2200):
+    """Check if image already meets target dimensions"""
+    try:
+        with Image.open(image_path) as img:
+            width, height = img.size
+            
+            # Check if already correct size (either orientation)
+            if ((width == target_width and height == target_height) or 
+                (width == target_height and height == target_width)):
+                return False
+                
+        return True
+    except Exception:
+        return True  # If we can't check, assume it needs resizing
+
+def resize_image_inplace(file_path, target_width=1700, target_height=2200, target_dpi=200):
+    """Resize image in place with retries"""
+    for attempt in range(3):
+        try:
+            with Image.open(file_path) as img:
+                original_width, original_height = img.size
+                original_is_landscape = original_width > original_height
+                
+                # Adjust target based on orientation
+                if original_is_landscape and target_width < target_height:
+                    target_width, target_height = target_height, target_width
+                elif not original_is_landscape and target_width > target_height:
+                    target_width, target_height = target_height, target_width
+
+                # Calculate scaling
+                scale = min(target_width / original_width, target_height / original_height)
+                new_width = int(original_width * scale)
+                new_height = int(original_height * scale)
+
+                # Resize and center
+                scaled_img = img.resize((new_width, new_height), Image.LANCZOS)
+                final_img = Image.new('RGB', (target_width, target_height), 'white')
+                
+                x_offset = (target_width - new_width) // 2
+                y_offset = (target_height - new_height) // 2
+                final_img.paste(scaled_img, (x_offset, y_offset))
+
+                # Convert to grayscale for TIFF processing
+                final_img = final_img.convert('L')
+
+                # Save as temporary file first (will be processed to TIFF later)
+                final_img.save(file_path, "JPEG", quality=95, dpi=(target_dpi, target_dpi))
+                
+                del scaled_img, final_img
+                gc.collect()
+                return True
+                
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1)  # 1 second delay before retry
+                continue
+            else:
+                logging.warning(f"Failed to resize {file_path} after 3 attempts: {e}")
+                return False
+    return False
 
 def parse_args():
     parser = argparse.ArgumentParser(description="TIFF Processor for PDFs and JPEGs")
@@ -128,11 +189,12 @@ class PDFProcessor:
                 else:
                     logging.warning(f"Failed to remove file {file_path}: {str(e)}")
 
-    def _convert_page(self, page, output_path):
+    def _convert_page(self, page, output_path, should_resize=True):
         """convert one pdf page to tiff with opencv adaptive thresholding and group4 compression"""
         temp_png = None
+        temp_jpeg = None
         try:
-            # create temp file for intermediate png
+            # create temp file for intermediate processing
             temp_dir = os.path.dirname(output_path)
             temp_basename = f"temp_{os.path.basename(output_path).replace('.tif', '')}_{int(time.time()*1000)}.png"
             temp_png = os.path.join(temp_dir, temp_basename)
@@ -175,6 +237,26 @@ class PDFProcessor:
                 
             if img is None:
                 raise ValueError(f"Failed to load image: Memory buffer and file approaches both failed")
+            
+            # Resize before thresholding if needed
+            if should_resize:
+                # Save as temporary JPEG for resizing
+                temp_jpeg_basename = f"temp_resize_{os.path.basename(output_path).replace('.tif', '')}_{int(time.time()*1000)}.jpg"
+                temp_jpeg = os.path.join(temp_dir, temp_jpeg_basename)
+                
+                # Convert opencv image to PIL and save
+                pil_img = Image.fromarray(img)
+                pil_img.save(temp_jpeg, "JPEG", quality=95, dpi=(self.dpi, self.dpi))
+                del pil_img
+                
+                # Check if resizing is needed and do it
+                if needs_resizing(temp_jpeg):
+                    resize_image_inplace(temp_jpeg)
+                
+                # Read back the resized image
+                img = cv2.imread(temp_jpeg, cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    raise ValueError("Failed to read resized image")
                 
             # Check if the page is predominantly dark
             # Calculate average brightness of the image
@@ -240,9 +322,12 @@ class PDFProcessor:
             # always clean up temp files
             if temp_png and os.path.exists(temp_png):
                 self._safe_remove(temp_png)
+            if temp_jpeg and os.path.exists(temp_jpeg):
+                self._safe_remove(temp_jpeg)
 
-    def _convert_jpeg_to_tiff(self, jpeg_path, output_path):
+    def _convert_jpeg_to_tiff(self, jpeg_path, output_path, should_resize=True):
         """convert a jpeg file to tiff using opencv adaptive thresholding with group4 compression"""
+        temp_jpeg = None
         try:
             # Normalize paths
             jpeg_path = os.path.normpath(jpeg_path)
@@ -263,10 +348,28 @@ class PDFProcessor:
                     logging.warning(f"Removing invalid existing TIFF: {output_path}")
                     self._safe_remove(output_path)
             
-            # Load image
-            img = cv2.imread(jpeg_path, cv2.IMREAD_GRAYSCALE)
+            # Handle resizing if needed
+            working_jpeg_path = jpeg_path
+            if should_resize and needs_resizing(jpeg_path):
+                # Create temp resized copy
+                temp_dir = os.path.dirname(jpeg_path)
+                temp_basename = f"temp_resize_{os.path.basename(jpeg_path)}_{int(time.time()*1000)}.jpg"
+                temp_jpeg = os.path.join(temp_dir, temp_basename)
+                
+                # Copy original to temp for resizing
+                shutil.copy2(jpeg_path, temp_jpeg)
+                
+                # Resize the temp copy
+                if resize_image_inplace(temp_jpeg):
+                    working_jpeg_path = temp_jpeg
+                else:
+                    # If resize failed, use original
+                    working_jpeg_path = jpeg_path
+            
+            # Load image for thresholding
+            img = cv2.imread(working_jpeg_path, cv2.IMREAD_GRAYSCALE)
             if img is None:
-                raise ValueError(f"Failed to load image with OpenCV: {jpeg_path}")
+                raise ValueError(f"Failed to load image with OpenCV: {working_jpeg_path}")
             
             # Check if the image is predominantly dark
             avg_brightness = np.mean(img)
@@ -345,6 +448,10 @@ class PDFProcessor:
             if os.path.exists(output_path):
                 self._safe_remove(output_path)
             return False
+        finally:
+            # Clean up temp resized JPEG if created
+            if temp_jpeg and os.path.exists(temp_jpeg):
+                self._safe_remove(temp_jpeg)
         
     def process_jpeg(self, jpeg_path):
         """process a single jpeg file to tiff - must succeed"""
@@ -359,6 +466,10 @@ class PDFProcessor:
         with self.file_locks[jpeg_path]:
             try:
                 logging.info(f"Processing jpeg: {jpeg_path}")
+                
+                # Check if folder wants resizing
+                folder_name = os.path.basename(os.path.dirname(jpeg_path))
+                should_resize = not folder_name.lower().endswith('--noresize')
                 
                 # Check if output already exists (from a previous run)
                 output_path = jpeg_path.rsplit('.', 1)[0] + '.tif'
@@ -381,7 +492,7 @@ class PDFProcessor:
                         time.sleep(1)  # pause before retry
                         
                     try:
-                        success = self._convert_jpeg_to_tiff(jpeg_path, output_path)
+                        success = self._convert_jpeg_to_tiff(jpeg_path, output_path, should_resize)
                         
                         # Verify the file exists and is valid
                         if success and os.path.exists(output_path) and self._validate_tiff(output_path):
@@ -409,7 +520,7 @@ class PDFProcessor:
                 logging.error(f"CRITICAL ERROR: jpeg processing failed for {jpeg_path}: {str(e)}")
                 return False
 
-    def _convert_page_with_retries(self, page, output_path, page_num, total_pages):
+    def _convert_page_with_retries(self, page, output_path, page_num, total_pages, should_resize=True):
         """Process a single page with infinite retries"""
         attempt = 0
         
@@ -422,7 +533,7 @@ class PDFProcessor:
             
             try:
                 # process the page
-                page_success = self._convert_page(page, output_path)
+                page_success = self._convert_page(page, output_path, should_resize)
                 
                 if page_success and os.path.exists(output_path) and self._validate_tiff(output_path):
                     # page converted successfully
@@ -448,6 +559,10 @@ class PDFProcessor:
             created_files = []
             doc = None
             
+            # Check if folder wants resizing
+            folder_name = os.path.basename(os.path.dirname(pdf_path))
+            should_resize = not folder_name.lower().endswith('--noresize')
+            
             try:
                 # Check file size to determine if memory mapping would be beneficial
                 # (memory parameter will be used differently depending on PyMuPDF version)
@@ -469,7 +584,7 @@ class PDFProcessor:
                 
                 # Pre-generate output paths for all pages
                 output_paths = [os.path.join(output_dir, f"{base_name}_page_{page_num+1:0{digits}d}.tif") 
-                               for page_num in range(total_pages)]
+                            for page_num in range(total_pages)]
                 
                 # Process pages in parallel but track results by page number
                 # Choose appropriate number of workers based on CPU cores, but avoid too many
@@ -486,7 +601,8 @@ class PDFProcessor:
                             doc[page_num], 
                             output_paths[page_num], 
                             page_num + 1, 
-                            total_pages
+                            total_pages,
+                            should_resize  # Add resize parameter
                         )
                         page_futures[future] = (page_num, output_paths[page_num])
                     
@@ -761,7 +877,14 @@ class PDFProcessor:
     def _move_folder(self, src_folder):
         """move processed folder to output location, merging if destination already exists"""
         try:
-            dest_folder = os.path.join(self.output_directory, os.path.basename(src_folder))
+            folder_name = os.path.basename(src_folder)
+            # Strip --noresize suffix (case insensitive)
+            if folder_name.lower().endswith('--noresize'):
+                clean_name = folder_name[:-10]  # Remove '--noresize'
+            else:
+                clean_name = folder_name
+                
+            dest_folder = os.path.join(self.output_directory, clean_name)
             
             if os.path.exists(dest_folder):
                 logging.info(f"destination exists, merging contents: {dest_folder}")

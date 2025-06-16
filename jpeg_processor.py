@@ -206,6 +206,64 @@ def safe_remove_file(file_path, max_retries=7, retry_delay=3):
     except Exception as rename_error:
         logging.error(f"Failed to rename file: {str(rename_error)}")
         return False
+    
+def needs_resizing(image_path, target_width=1700, target_height=2200):
+    """Check if image already meets target dimensions"""
+    try:
+        with Image.open(image_path) as img:
+            width, height = img.size
+            
+            # Check if already correct size (either orientation)
+            if ((width == target_width and height == target_height) or 
+                (width == target_height and height == target_width)):
+                return False
+                
+        return True
+    except Exception:
+        return True  # If we can't check, assume it needs resizing
+
+def resize_image_inplace(file_path, target_width=1700, target_height=2200, target_dpi=200):
+    """Resize image in place with retries"""
+    for attempt in range(3):
+        try:
+            with Image.open(file_path) as img:
+                original_width, original_height = img.size
+                original_is_landscape = original_width > original_height
+                
+                # Adjust target based on orientation
+                if original_is_landscape and target_width < target_height:
+                    target_width, target_height = target_height, target_width
+                elif not original_is_landscape and target_width > target_height:
+                    target_width, target_height = target_height, target_width
+
+                # Calculate scaling
+                scale = min(target_width / original_width, target_height / original_height)
+                new_width = int(original_width * scale)
+                new_height = int(original_height * scale)
+
+                # Resize and center
+                scaled_img = img.resize((new_width, new_height), Image.LANCZOS)
+                final_img = Image.new('RGB', (target_width, target_height), 'white')
+                
+                x_offset = (target_width - new_width) // 2
+                y_offset = (target_height - new_height) // 2
+                final_img.paste(scaled_img, (x_offset, y_offset))
+
+                # Save with target DPI
+                final_img.save(file_path, "JPEG", quality=75, dpi=(target_dpi, target_dpi))
+                
+                del scaled_img, final_img
+                gc.collect()
+                return True
+                
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1)  # 1 second delay before retry
+                continue
+            else:
+                logging.warning(f"Failed to resize {file_path} after 3 attempts: {e}")
+                return False
+    return False
 
 class PDFProcessor:
     def __init__(self, watch_directory, output_directory, dpi=200):
@@ -218,8 +276,8 @@ class PDFProcessor:
         self.lock = threading.Lock()
         logging.info(f"Initializing PDFProcessor with watch dir: {watch_directory}, output dir: {output_directory}, dpi: {dpi}")
 
-    def _process_page(self, page, output_path, page_num, total_pages):
-        """Process a single page from PDF to JPEG with retries"""
+    def _process_page(self, page, output_path, page_num, total_pages, should_resize=True):
+        """Process a single page from PDF to JPEG with optional resizing"""
         logging.info(f"Processing page {page_num} of {total_pages}")
         attempt = 0
         max_attempts = 3
@@ -249,6 +307,10 @@ class PDFProcessor:
                 # Force garbage collection
                 gc.collect()
                 
+                # Resize immediately after creation if needed
+                if should_resize and needs_resizing(output_path):
+                    resize_image_inplace(output_path)
+                
                 return True
                 
             except Exception as e:
@@ -275,6 +337,10 @@ class PDFProcessor:
             doc = None
             converted_pages = []
             
+            # Check if folder wants resizing
+            folder_name = os.path.basename(os.path.dirname(pdf_path))
+            should_resize = not folder_name.lower().endswith('--noresize')
+            
             try:
                 # Check file size to determine if memory mapping would be beneficial
                 file_size = os.path.getsize(pdf_path)
@@ -297,7 +363,7 @@ class PDFProcessor:
                 
                 # Pre-generate output paths for all pages
                 output_paths = [os.path.join(pdf_dir, f"{pdf_filename}_page_{page_num + 1:0{digits}d}.jpg") 
-                               for page_num in range(total_pages)]
+                            for page_num in range(total_pages)]
                 
                 # Process pages in parallel 
                 max_workers = min(os.cpu_count() or 4, 4)  # Limit to 4 threads max
@@ -313,7 +379,8 @@ class PDFProcessor:
                             doc[page_num], 
                             output_paths[page_num], 
                             page_num + 1, 
-                            total_pages
+                            total_pages,
+                            should_resize  # Add resize parameter
                         )
                         page_futures[future] = (page_num, output_paths[page_num])
                     
@@ -596,14 +663,17 @@ class PDFProcessor:
                 # Force garbage collection
                 gc.collect()
                 
-                
-
     def _move_folder(self, folder_path):
-        """Move processed folder to output location, merging if destination already exists.
-        Returns the destination folder path if successful, None otherwise."""
+        """Move processed folder to output location, stripping --noresize suffix"""
         try:
-            # Get the destination folder path
-            dest_folder = os.path.join(self.output_directory, os.path.basename(folder_path))
+            folder_name = os.path.basename(folder_path)
+            # Strip --noresize suffix (case insensitive)
+            if folder_name.lower().endswith('--noresize'):
+                clean_name = folder_name[:-10]  # Remove '--noresize'
+            else:
+                clean_name = folder_name
+                
+            dest_folder = os.path.join(self.output_directory, clean_name)
             
             # handle if dest already exists
             if os.path.exists(dest_folder):
