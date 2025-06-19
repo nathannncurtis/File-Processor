@@ -515,7 +515,7 @@ class PDFProcessor:
         return False
 
     def process_pdf(self, pdf_path):
-        """convert pdf file to tiff files - must convert ALL pages"""
+        """convert pdf file to tiff files - must convert ALL pages using chunked processing"""
         # Create file lock if it doesn't exist
         if pdf_path not in self.file_locks:
             self.file_locks[pdf_path] = threading.Lock()
@@ -524,8 +524,6 @@ class PDFProcessor:
         with self.file_locks[pdf_path]:
             success = True
             created_files = []
-            doc = None
-            page_data_list = []
             
             # Check if folder wants resizing
             folder_name = os.path.basename(os.path.dirname(pdf_path))
@@ -548,26 +546,86 @@ class PDFProcessor:
 
                 logging.info(f"processing pdf: {pdf_path} ({total_pages} pages)")
                 
-                # Pre-generate output paths for all pages
-                output_paths = [os.path.join(output_dir, f"{base_name}_page_{page_num+1:0{digits}d}.tif") 
-                            for page_num in range(total_pages)]
+                # Process in chunks of 10,000 pages
+                chunk_size = 10000
+                max_workers = min(os.cpu_count() or 4, 4)
                 
-                # Extract all page data FIRST while doc is open, then close doc immediately
-                logging.info(f"Extracting page data from PDF...")
-                for page_num in range(total_pages):
-                    try:
-                        page = doc[page_num]
-                        pix = page.get_pixmap(dpi=self.dpi, alpha=False)
-                        page_data = pix.tobytes("png")
-                        page_data_list.append(page_data)
-                        # Explicitly release pixmap and page
-                        pix = None
-                        page = None
-                    except Exception as e:
-                        logging.error(f"Failed to extract page {page_num+1}: {str(e)}")
-                        page_data_list.append(None)
+                for chunk_start in range(0, total_pages, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, total_pages)
+                    chunk_pages = chunk_end - chunk_start
+                    
+                    logging.info(f"Processing chunk {chunk_start//chunk_size + 1}/{(total_pages + chunk_size - 1)//chunk_size}: pages {chunk_start + 1}-{chunk_end}")
+                    
+                    # Extract page data for this chunk only
+                    page_data_list = []
+                    output_paths = []
+                    
+                    for page_num in range(chunk_start, chunk_end):
+                        try:
+                            page = doc[page_num]
+                            pix = page.get_pixmap(dpi=self.dpi, alpha=False)
+                            page_data = pix.tobytes("png")
+                            page_data_list.append(page_data)
+                            
+                            # Generate output path for this page
+                            output_path = os.path.join(output_dir, f"{base_name}_page_{page_num+1:0{digits}d}.tif")
+                            output_paths.append(output_path)
+                            
+                            # Explicitly release pixmap and page
+                            pix = None
+                            page = None
+                        except Exception as e:
+                            logging.error(f"Failed to extract page {page_num+1}: {str(e)}")
+                            page_data_list.append(None)
+                            output_paths.append(None)
+                    
+                    # Process this chunk with ThreadPoolExecutor
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        page_futures = {}
+                        
+                        # Submit pages in this chunk for processing
+                        for i, (page_data, output_path) in enumerate(zip(page_data_list, output_paths)):
+                            if page_data is not None and output_path is not None:
+                                page_num = chunk_start + i
+                                future = executor.submit(
+                                    self._convert_page_with_retries, 
+                                    page_data, 
+                                    output_path, 
+                                    page_num + 1, 
+                                    total_pages,
+                                    should_resize
+                                )
+                                page_futures[future] = (page_num, output_path)
+                        
+                        # Collect results for this chunk
+                        for future in as_completed(page_futures):
+                            page_num, output_path = page_futures[future]
+                            try:
+                                page_success = future.result()
+                                if page_success:
+                                    created_files.append(output_path)
+                                    with self.lock:
+                                        self.success_count += 1
+                                else:
+                                    logging.error(f"Failed to process page {page_num+1} despite retries")
+                                    success = False
+                            except Exception as e:
+                                logging.error(f"Error processing page {page_num+1}: {str(e)}")
+                                success = False
+                    
+                    # Clear chunk data from memory
+                    page_data_list.clear()
+                    page_data_list = None
+                    output_paths = None
+                    
+                    # Force garbage collection after each chunk
+                    for _ in range(3):
+                        gc.collect()
+                        time.sleep(0.1)
+                    
+                    logging.info(f"Completed chunk {chunk_start//chunk_size + 1}, processed {chunk_pages} pages")
                 
-                # CRITICAL: Force close and clear ALL references to the document
+                # Close document after all chunks are processed
                 if doc:
                     try:
                         doc.close()
@@ -575,97 +633,31 @@ class PDFProcessor:
                     except Exception as e:
                         logging.warning(f"Error closing PDF document: {str(e)}")
                     finally:
-                        doc = None  # Clear the reference
+                        doc = None
                 
-                # Force immediate garbage collection multiple times
-                for _ in range(3):
-                    gc.collect()
-                    time.sleep(0.5)
-                
-                # Additional Windows-specific handle release
-                if platform.system() == 'Windows':
-                    try:
-                        import ctypes
-                        # Force working set trim to release handles
-                        ctypes.windll.kernel32.SetProcessWorkingSetSize(-1, -1)
-                        # Additional delay for Windows to release file handles
-                        time.sleep(2)
-                    except Exception as e:
-                        logging.warning(f"Error with Windows memory management: {str(e)}")
-                
-                # Force another round of garbage collection after Windows cleanup
-                for _ in range(2):
-                    gc.collect()
-                    time.sleep(0.5)
-                    
-                logging.info(f"All file handles should now be released for: {pdf_path}")
-                
-                # Now process pages in parallel using the extracted data
-                max_workers = min(os.cpu_count() or 4, 4)
-                
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    page_futures = {}
-                    
-                    # Submit all pages for processing using page data
-                    for page_num in range(total_pages):
-                        if page_data_list[page_num] is not None:
-                            future = executor.submit(
-                                self._convert_page_with_retries, 
-                                page_data_list[page_num], 
-                                output_paths[page_num], 
-                                page_num + 1, 
-                                total_pages,
-                                should_resize
-                            )
-                            page_futures[future] = (page_num, output_paths[page_num])
-                    
-                    # Collect results as they complete
-                    for future in as_completed(page_futures):
-                        page_num, output_path = page_futures[future]
-                        try:
-                            page_success = future.result()
-                            if page_success:
-                                created_files.append(output_path)
-                                with self.lock:
-                                    self.success_count += 1
-                            else:
-                                logging.error(f"Failed to process page {page_num+1} despite retries")
-                                success = False
-                        except Exception as e:
-                            logging.error(f"Error processing page {page_num+1}: {str(e)}")
-                            success = False
-                
-                # Clear page data from memory and force garbage collection
-                page_data_list.clear()
-                page_data_list = None
-                
-                # Enhanced garbage collection and handle release
+                # Final cleanup
                 for _ in range(5):
                     gc.collect()
                     time.sleep(0.5)
                 
-                # Additional aggressive cleanup to release any lingering file handles
-                import sys
-                if hasattr(sys, '_clear_type_cache'):
-                    sys._clear_type_cache()
-                
-                # Extra wait to ensure all file handles are fully released
-                time.sleep(3)
-                
-                # Force final garbage collection
-                for _ in range(3):
-                    gc.collect()
-                    time.sleep(0.5)
+                # Additional Windows-specific cleanup
+                if platform.system() == 'Windows':
+                    try:
+                        import ctypes
+                        ctypes.windll.kernel32.SetProcessWorkingSetSize(-1, -1)
+                        time.sleep(2)
+                    except Exception as e:
+                        logging.warning(f"Error with Windows memory management: {str(e)}")
                 
                 # final status check - all pages must be converted
                 if len(created_files) == total_pages:
                     logging.info(f"all {total_pages} pages of {pdf_path} processed successfully")
                     
-                    # Additional wait specifically before PDF deletion attempt
+                    # Additional wait before PDF deletion
                     logging.info("Waiting additional time before attempting PDF deletion...")
                     time.sleep(5)
                     
-                    # Try delete with maximum retries and longer delays
+                    # Try delete with maximum retries
                     delete_success = self._safe_remove_with_retries(pdf_path, max_retries=15, retry_delay=5)
                     if not delete_success:
                         logging.error(f"Could not delete PDF after multiple attempts: {pdf_path}")
@@ -684,8 +676,8 @@ class PDFProcessor:
                 return False
                     
             finally:
-                # FINAL cleanup in finally block - ensure document is closed no matter what
-                if doc:
+                # Final cleanup in finally block
+                if 'doc' in locals() and doc:
                     try:
                         doc.close()
                         logging.info(f"PDF document force closed in finally block")
@@ -694,12 +686,7 @@ class PDFProcessor:
                     finally:
                         doc = None
                 
-                # Clear any remaining page data
-                if page_data_list:
-                    page_data_list.clear()
-                    page_data_list = None
-                
-                # Final aggressive garbage collection
+                # Final garbage collection
                 for _ in range(3):
                     gc.collect()
                     time.sleep(0.5)
@@ -728,7 +715,7 @@ class PDFProcessor:
         return False
 
     def process_folder(self, folder_path):
-        """process all pdfs and jpegs in a folder with proper tracking"""
+        """process all pdfs and jpegs in a folder with proper tracking and chunked processing"""
         # Create folder lock if it doesn't exist
         if folder_path not in self.folder_locks:
             self.folder_locks[folder_path] = threading.Lock()
@@ -804,7 +791,7 @@ class PDFProcessor:
                     logging.info(f"Folder previously processed but contains new files: {folder_path}")
                     self.processed_folders.remove(folder_path)
                 
-                # Process PDFs sequentially (they handle internal parallelism)
+                # Process PDFs sequentially (they handle internal parallelism and chunking)
                 pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.pdf')]
                 pdf_results = []
                 pdf_deletion_success = True
@@ -826,30 +813,57 @@ class PDFProcessor:
                     # Additional wait to release any lingering handles from PDF processing
                     time.sleep(1)
 
-                # Process JPEGs with proper tracking - SEQUENTIAL to avoid race conditions
+                # Process JPEGs with chunked processing to avoid memory issues
                 jpeg_files = [f for f in os.listdir(folder_path) 
                             if f.lower().endswith(('.jpg', '.jpeg'))]
                 
-                logging.info(f"Processing {len(jpeg_files)} JPEG files sequentially to avoid race conditions")
-                
-                jpeg_results = []
-                processed_jpegs = set()
-                
-                # Process all JPEGs sequentially
-                for jpeg_file in jpeg_files:
-                    jpeg_path = os.path.join(folder_path, jpeg_file)
+                if jpeg_files:
+                    logging.info(f"Processing {len(jpeg_files)} JPEG files in chunks to avoid memory issues")
                     
-                    # Skip if already processed (shouldn't happen but safety check)
-                    if jpeg_file in processed_jpegs:
-                        logging.warning(f"JPEG {jpeg_file} already processed, skipping")
-                        continue
+                    jpeg_results = []
+                    processed_jpegs = set()
+                    jpeg_chunk_size = 1000  # Process 1000 JPEGs at a time
                     
-                    result = self.process_jpeg(jpeg_path)
-                    jpeg_results.append(result)
-                    processed_jpegs.add(jpeg_file)
+                    # Process JPEGs in chunks
+                    for chunk_start in range(0, len(jpeg_files), jpeg_chunk_size):
+                        chunk_end = min(chunk_start + jpeg_chunk_size, len(jpeg_files))
+                        jpeg_chunk = jpeg_files[chunk_start:chunk_end]
+                        chunk_num = (chunk_start // jpeg_chunk_size) + 1
+                        total_chunks = ((len(jpeg_files) + jpeg_chunk_size - 1) // jpeg_chunk_size)
+                        
+                        logging.info(f"Processing JPEG chunk {chunk_num}/{total_chunks}: files {chunk_start+1}-{chunk_end}")
+                        
+                        # Process this chunk sequentially
+                        for jpeg_file in jpeg_chunk:
+                            jpeg_path = os.path.join(folder_path, jpeg_file)
+                            
+                            # Skip if already processed (shouldn't happen but safety check)
+                            if jpeg_file in processed_jpegs:
+                                logging.warning(f"JPEG {jpeg_file} already processed, skipping")
+                                continue
+                            
+                            result = self.process_jpeg(jpeg_path)
+                            jpeg_results.append(result)
+                            processed_jpegs.add(jpeg_file)
+                            
+                            # Log progress within chunk (every 100 files)
+                            if len(processed_jpegs) % 100 == 0:
+                                logging.info(f"Processed {len(processed_jpegs)}/{len(jpeg_files)} JPEGs")
+                        
+                        # Force garbage collection after each chunk
+                        gc.collect()
+                        
+                        # Brief pause to let system catch up
+                        time.sleep(0.5)
+                        
+                        logging.info(f"Completed JPEG chunk {chunk_num}/{total_chunks}")
                     
-                    # Log progress
-                    logging.info(f"Processed JPEG {len(processed_jpegs)}/{len(jpeg_files)}: {jpeg_file}")
+                    # Final JPEG processing summary
+                    logging.info(f"Completed all JPEG processing: {len(processed_jpegs)} files processed")
+                else:
+                    # No JPEGs found
+                    jpeg_results = []
+                    processed_jpegs = set()
 
                 # Check for any remaining files after processing  
                 remaining_jpegs = [f for f in os.listdir(folder_path) 

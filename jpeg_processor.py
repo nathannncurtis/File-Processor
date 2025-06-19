@@ -9,7 +9,8 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import fitz  # PyMuPDF
 from PIL import Image
-import io
+import numpy as np
+import cv2
 import argparse
 import logging
 import traceback
@@ -150,45 +151,8 @@ def safe_remove_file(file_path, max_retries=7, retry_delay=3):
                 return True
         except PermissionError:
             logging.warning(f"Permission error deleting file on attempt {attempt+1}")
-            # For permission errors, try to diagnose what might be holding the file
-            try:
-                if platform.system() == 'Windows':
-                    import subprocess
-                    # Using handle.exe if available (SysInternals tools)
-                    handle_check = subprocess.run(
-                        ['handle', normalized_path], 
-                        shell=True, 
-                        capture_output=True, 
-                        text=True
-                    )
-                    if handle_check.stdout:
-                        logging.info(f"Files using the handle: {handle_check.stdout}")
-            except Exception:
-                pass  # Silently ignore if we can't run handle.exe
-                
         except Exception as e:
             logging.warning(f"Attempt {attempt+1} to remove file failed: {normalized_path}, Error: {str(e)}")
-            
-        # Try to free resources that might be holding the file
-        try:
-            if os.path.exists(normalized_path):
-                # See if we have it open
-                process = psutil.Process(os.getpid())
-                open_files = process.open_files()
-                file_in_use = any(f.path == os.path.abspath(normalized_path) for f in open_files)
-                if file_in_use:
-                    logging.warning(f"File is still in use by this process: {normalized_path}")
-                    # Try to force cleanup
-                    gc.collect()
-                    
-                    # More aggressive - try to explicitly close all file handles
-                    for fd in range(0, 1024):  # arbitrary upper limit
-                        try:
-                            os.close(fd)
-                        except:
-                            pass
-        except Exception as diag_error:
-            logging.warning(f"Error diagnosing file lock: {str(diag_error)}")
         
         # Use longer retry delay for later attempts
         current_delay = retry_delay * (attempt + 1)
@@ -206,64 +170,6 @@ def safe_remove_file(file_path, max_retries=7, retry_delay=3):
     except Exception as rename_error:
         logging.error(f"Failed to rename file: {str(rename_error)}")
         return False
-    
-def needs_resizing(image_path, target_width=1700, target_height=2200):
-    """Check if image already meets target dimensions"""
-    try:
-        with Image.open(image_path) as img:
-            width, height = img.size
-            
-            # Check if already correct size (either orientation)
-            if ((width == target_width and height == target_height) or 
-                (width == target_height and height == target_width)):
-                return False
-                
-        return True
-    except Exception:
-        return True  # If we can't check, assume it needs resizing
-
-def resize_image_inplace(file_path, target_width=1700, target_height=2200, target_dpi=200):
-    """Resize image in place with retries"""
-    for attempt in range(3):
-        try:
-            with Image.open(file_path) as img:
-                original_width, original_height = img.size
-                original_is_landscape = original_width > original_height
-                
-                # Adjust target based on orientation
-                if original_is_landscape and target_width < target_height:
-                    target_width, target_height = target_height, target_width
-                elif not original_is_landscape and target_width > target_height:
-                    target_width, target_height = target_height, target_width
-
-                # Calculate scaling
-                scale = min(target_width / original_width, target_height / original_height)
-                new_width = int(original_width * scale)
-                new_height = int(original_height * scale)
-
-                # Resize and center
-                scaled_img = img.resize((new_width, new_height), Image.LANCZOS)
-                final_img = Image.new('RGB', (target_width, target_height), 'white')
-                
-                x_offset = (target_width - new_width) // 2
-                y_offset = (target_height - new_height) // 2
-                final_img.paste(scaled_img, (x_offset, y_offset))
-
-                # Save with target DPI
-                final_img.save(file_path, "JPEG", quality=75, dpi=(target_dpi, target_dpi))
-                
-                del scaled_img, final_img
-                gc.collect()
-                return True
-                
-        except Exception as e:
-            if attempt < 2:
-                time.sleep(1)  # 1 second delay before retry
-                continue
-            else:
-                logging.warning(f"Failed to resize {file_path} after 3 attempts: {e}")
-                return False
-    return False
 
 class PDFProcessor:
     def __init__(self, watch_directory, output_directory, dpi=200):
@@ -276,65 +182,110 @@ class PDFProcessor:
         self.lock = threading.Lock()
         logging.info(f"Initializing PDFProcessor with watch dir: {watch_directory}, output dir: {output_directory}, dpi: {dpi}")
 
-    def _process_page(self, page, output_path, page_num, total_pages, should_resize=True):
-        """Process a single page from PDF to JPEG with optional resizing"""
-        logging.info(f"Processing page {page_num} of {total_pages}")
+    def _process_page(self, page_data, output_path, page_num, total_pages, should_resize=True):
+        """Process a single page from PDF to JPEG with optional resizing - ALL IN MEMORY"""
+        try:
+            # Convert page data (bytes) to numpy array for OpenCV
+            nparr = np.frombuffer(page_data, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if img is None:
+                raise ValueError(f"Failed to decode page data for page {page_num}")
+            
+            # Convert BGR to RGB (OpenCV uses BGR, PIL uses RGB)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # Convert to PIL Image
+            pil_img = Image.fromarray(img)
+            
+            # Handle resizing in memory if needed (same as TIFF script)
+            if should_resize:
+                original_width, original_height = pil_img.size
+                original_is_landscape = original_width > original_height
+                
+                # Set target dimensions based on orientation
+                target_width = 1700
+                target_height = 2200
+                if original_is_landscape and target_width < target_height:
+                    target_width, target_height = target_height, target_width
+                elif not original_is_landscape and target_width > target_height:
+                    target_width, target_height = target_height, target_width
+                
+                # Calculate scaling
+                scale = min(target_width / original_width, target_height / original_height)
+                new_width = int(original_width * scale)
+                new_height = int(original_height * scale)
+                
+                # Resize image in memory
+                pil_img = pil_img.resize((new_width, new_height), Image.LANCZOS)
+                
+                # Create final image with white background
+                final_img = Image.new('RGB', (target_width, target_height), 'white')
+                
+                # Calculate centering offsets
+                x_offset = (target_width - new_width) // 2
+                y_offset = (target_height - new_height) // 2
+                
+                # Paste resized image in center
+                final_img.paste(pil_img, (x_offset, y_offset))
+                
+                # Update img to the final resized version
+                pil_img = final_img
+            
+            # Save directly as JPEG with DPI
+            pil_img.save(output_path, "JPEG", quality=75, dpi=(self.dpi, self.dpi))
+            
+            # Clean up memory
+            img = None
+            pil_img = None
+            gc.collect()
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"Error processing page {page_num}: {str(e)}")
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except:
+                    pass
+            return False
+
+    def _process_page_with_retries(self, page_data, output_path, page_num, total_pages, should_resize=True):
+        """Process a single page with infinite retries using page data (bytes)"""
         attempt = 0
-        max_attempts = 3
         
-        while attempt < max_attempts:
+        # infinite retry loop - never give up on a page
+        while True:
             attempt += 1
+            if attempt > 1:
+                logging.warning(f"retry attempt {attempt} for page {page_num} of {total_pages}")
+                time.sleep(1)  # brief pause before retry
             
             try:
-                # make pixmap at specified dpi
-                pix = page.get_pixmap(dpi=self.dpi)
+                # process the page using page data (pass bytes directly)
+                page_success = self._process_page(page_data, output_path, page_num, total_pages, should_resize)
                 
-                # convert pixmap to PIL Image
-                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-                
-                # Free pixmap memory
-                pix = None
-                
-                # store dpi in image
-                img.info['dpi'] = (self.dpi, self.dpi)
-                
-                # save as jpeg
-                img.save(output_path, "JPEG", quality=75, dpi=(self.dpi, self.dpi))
-                
-                # Free image memory
-                img = None
-                
-                # Force garbage collection
-                gc.collect()
-                
-                # Resize immediately after creation if needed
-                if should_resize and needs_resizing(output_path):
-                    resize_image_inplace(output_path)
-                
-                return True
-                
+                if page_success and os.path.exists(output_path):
+                    # page converted successfully
+                    logging.info(f"successfully converted page {page_num} of {total_pages}")
+                    return True
+                else:
+                    logging.warning(f"failed attempt {attempt} for page {page_num}")
             except Exception as e:
-                logging.error(f"Error on attempt {attempt} processing page {page_num}: {str(e)}")
-                
-                if attempt < max_attempts:
-                    logging.info(f"Retrying page {page_num}...")
-                    time.sleep(1)  # brief pause before retry
-                    
-                    # Force garbage collection before retry
-                    gc.collect()
+                logging.error(f"error on attempt {attempt} for page {page_num}: {str(e)}")
         
-        logging.error(f"Failed to process page {page_num} after {max_attempts} attempts")
+        # This line should never be reached because the loop only exits with a return
         return False
 
     def process_pdf_to_jpgs(self, pdf_path):
-        """turn pdf into jpg images using parallel processing. returns (converted files list, success)"""
+        """turn pdf into jpg images using chunked processing. returns (converted files list, success)"""
         # Create file lock if it doesn't exist
         if pdf_path not in self.file_locks:
             self.file_locks[pdf_path] = threading.Lock()
             
         # Lock this PDF for exclusive access
         with self.file_locks[pdf_path]:
-            doc = None
             converted_pages = []
             
             # Check if folder wants resizing
@@ -345,12 +296,10 @@ class PDFProcessor:
                 # Check file size to determine if memory mapping would be beneficial
                 file_size = os.path.getsize(pdf_path)
                 
-                # Open the pdf file - try to use memory mapping if available in this PyMuPDF version
+                # Open the pdf file - try to use memory mapping if available
                 try:
-                    # Try with the memory parameter (newer versions of PyMuPDF)
                     doc = fitz.open(pdf_path, filetype="pdf", memory=file_size > 50_000_000)
                 except TypeError:
-                    # Fallback for older versions that don't support the memory parameter
                     doc = fitz.open(pdf_path)
                     
                 total_pages = len(doc)
@@ -361,50 +310,114 @@ class PDFProcessor:
                 pdf_dir = os.path.dirname(pdf_path)
                 pdf_filename = os.path.splitext(os.path.basename(pdf_path))[0]
                 
-                # Pre-generate output paths for all pages
-                output_paths = [os.path.join(pdf_dir, f"{pdf_filename}_page_{page_num + 1:0{digits}d}.jpg") 
-                            for page_num in range(total_pages)]
+                # Process in chunks of 10,000 pages
+                chunk_size = 10000
+                max_workers = min(os.cpu_count() or 4, 4)
                 
-                # Process pages in parallel 
-                max_workers = min(os.cpu_count() or 4, 4)  # Limit to 4 threads max
-                
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    # Map to store futures by page number
-                    page_futures = {}
+                for chunk_start in range(0, total_pages, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, total_pages)
+                    chunk_pages = chunk_end - chunk_start
                     
-                    # Submit all pages for processing
-                    for page_num in range(total_pages):
-                        future = executor.submit(
-                            self._process_page, 
-                            doc[page_num], 
-                            output_paths[page_num], 
-                            page_num + 1, 
-                            total_pages,
-                            should_resize  # Add resize parameter
-                        )
-                        page_futures[future] = (page_num, output_paths[page_num])
+                    logging.info(f"Processing chunk {chunk_start//chunk_size + 1}/{(total_pages + chunk_size - 1)//chunk_size}: pages {chunk_start + 1}-{chunk_end}")
                     
-                    # Collect results as they complete
-                    successful_pages = 0
-                    for future in as_completed(page_futures):
-                        page_num, output_path = page_futures[future]
+                    # Extract page data for this chunk only
+                    page_data_list = []
+                    output_paths = []
+                    
+                    for page_num in range(chunk_start, chunk_end):
                         try:
-                            page_success = future.result()
-                            if page_success:
-                                converted_pages.append(output_path)
-                                successful_pages += 1
-                                logging.info(f"Saved page {page_num + 1} as {os.path.basename(output_path)}")
-                            else:
-                                logging.error(f"Failed to process page {page_num + 1}")
+                            page = doc[page_num]
+                            pix = page.get_pixmap(dpi=self.dpi, alpha=False)
+                            page_data = pix.tobytes("png")
+                            page_data_list.append(page_data)
+                            
+                            # Generate output path for this page
+                            output_path = os.path.join(pdf_dir, f"{pdf_filename}_page_{page_num + 1:0{digits}d}.jpg")
+                            output_paths.append(output_path)
+                            
+                            # Explicitly release pixmap and page
+                            pix = None
+                            page = None
                         except Exception as e:
-                            logging.error(f"Error processing page {page_num + 1}: {str(e)}")
+                            logging.error(f"Failed to extract page {page_num+1}: {str(e)}")
+                            page_data_list.append(None)
+                            output_paths.append(None)
+                    
+                    # Process this chunk with ThreadPoolExecutor
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        page_futures = {}
+                        
+                        # Submit pages in this chunk for processing
+                        for i, (page_data, output_path) in enumerate(zip(page_data_list, output_paths)):
+                            if page_data is not None and output_path is not None:
+                                page_num = chunk_start + i
+                                future = executor.submit(
+                                    self._process_page_with_retries,
+                                    page_data, 
+                                    output_path, 
+                                    page_num + 1, 
+                                    total_pages,
+                                    should_resize
+                                )
+                                page_futures[future] = (page_num, output_path)
+                        
+                        # Collect results for this chunk
+                        successful_pages = 0
+                        for future in as_completed(page_futures):
+                            page_num, output_path = page_futures[future]
+                            try:
+                                page_success = future.result()
+                                if page_success:
+                                    converted_pages.append(output_path)
+                                    successful_pages += 1
+                                    logging.info(f"Saved page {page_num + 1} as {os.path.basename(output_path)}")
+                                else:
+                                    logging.error(f"Failed to process page {page_num + 1}")
+                            except Exception as e:
+                                logging.error(f"Error processing page {page_num + 1}: {str(e)}")
+                    
+                    # Clear chunk data from memory
+                    page_data_list.clear()
+                    page_data_list = None
+                    output_paths = None
+                    
+                    # Force garbage collection after each chunk
+                    for _ in range(3):
+                        gc.collect()
+                        time.sleep(0.1)
+                    
+                    logging.info(f"Completed chunk {chunk_start//chunk_size + 1}, processed {chunk_pages} pages")
+                
+                # Close document after all chunks are processed
+                if doc:
+                    try:
+                        doc.close()
+                        logging.info(f"PDF document closed")
+                    except Exception as e:
+                        logging.warning(f"Error closing PDF document: {str(e)}")
+                    finally:
+                        doc = None
+                
+                # Final cleanup
+                for _ in range(5):
+                    gc.collect()
+                    time.sleep(0.5)
+                
+                # Additional Windows-specific cleanup
+                if platform.system() == 'Windows':
+                    try:
+                        import ctypes
+                        ctypes.windll.kernel32.SetProcessWorkingSetSize(-1, -1)
+                        time.sleep(2)
+                    except Exception as e:
+                        logging.warning(f"Error with Windows memory management: {str(e)}")
                 
                 # Check if all pages worked
-                all_pages_converted = (successful_pages == total_pages)
+                all_pages_converted = (len(converted_pages) == total_pages)
                 if all_pages_converted:
                     logging.info(f"Successfully converted all {total_pages} pages from {pdf_path}")
                 else:
-                    logging.warning(f"Only converted {successful_pages} out of {total_pages} pages from {pdf_path}")
+                    logging.warning(f"Only converted {len(converted_pages)} out of {total_pages} pages from {pdf_path}")
                 
                 return converted_pages, all_pages_converted
             
@@ -415,15 +428,17 @@ class PDFProcessor:
             
             finally:
                 # cleanup pdf
-                if doc:
+                if 'doc' in locals() and doc:
                     try:
                         doc.close()
-                        doc = None  # help garbage collection
+                        doc = None
                     except Exception as close_error:
                         logging.error(f"Error closing PDF {pdf_path}: {close_error}")
                 
-                # Force garbage collection
-                gc.collect()
+                # Final garbage collection
+                for _ in range(3):
+                    gc.collect()
+                    time.sleep(0.5)
                 
                 # More aggressive memory cleanup on Windows
                 if platform.system() == 'Windows':
@@ -432,9 +447,7 @@ class PDFProcessor:
                         ctypes.windll.kernel32.SetProcessWorkingSetSize(-1, -1)
                     except Exception as e:
                         logging.warning(f"Error freeing memory on Windows: {str(e)}")
-                        
-                # Final additional cleanup specific for network shares
-                # Wait a bit for file handle release
+                
                 time.sleep(1)
 
     def process_folder(self, folder_path):
@@ -562,22 +575,6 @@ class PDFProcessor:
                         # Wait for file handles to release - longer wait for network shares
                         time.sleep(5)
                         
-                        # Try to ensure file isn't in use by other processes on Windows
-                        if platform.system() == 'Windows':
-                            try:
-                                # Check if the PDF file might be in use by another process
-                                import subprocess
-                                openfiles_cmd = f'openfiles /query /fo csv | find "{os.path.basename(pdf_path)}"'
-                                try:
-                                    result = subprocess.run(openfiles_cmd, shell=True, capture_output=True, text=True)
-                                    if os.path.basename(pdf_path) in result.stdout:
-                                        logging.warning(f"PDF file appears to be in use by another process: {pdf_path}")
-                                        time.sleep(10)  # Extra wait time
-                                except Exception as proc_err:
-                                    logging.warning(f"Error checking for file usage: {proc_err}")
-                            except Exception as e:
-                                logging.warning(f"Error during Windows-specific file check: {e}")
-                        
                         # Remove original PDF if successful
                         if converted_pages and all_pages_converted:
                             # Try to delete original with enhanced removal
@@ -585,19 +582,8 @@ class PDFProcessor:
                             
                             if not deletion_successful:
                                 logging.warning(f"Could not delete PDF {pdf_path}")
-                                
-                                # If we can't delete, try to at least rename to indicate it's processed
-                                try:
-                                    processed_mark = pdf_path + ".processed"
-                                    os.rename(pdf_path, processed_mark)
-                                    logging.info(f"Renamed PDF to {processed_mark} since deletion failed")
-                                    # Track that we couldn't delete this PDF
-                                    all_pdfs_deleted = False
-                                    remaining_pdfs.append(processed_mark)
-                                except Exception as rename_err:
-                                    logging.warning(f"Failed to rename processed PDF: {rename_err}")
-                                    all_pdfs_deleted = False
-                                    remaining_pdfs.append(pdf_path)
+                                all_pdfs_deleted = False
+                                remaining_pdfs.append(pdf_path)
                         else:
                             logging.warning(f"Not deleting PDF {pdf_path} because conversion was incomplete")
                             all_pdfs_deleted = False
@@ -617,22 +603,16 @@ class PDFProcessor:
                     if os.path.exists(folder_path):
                         current_files = os.listdir(folder_path)
                         for filename in current_files:
-                            # Log all files for debugging
                             file_path = os.path.join(folder_path, filename)
-                            try:
-                                file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 'N/A'
-                                logging.info(f"Found file in final check: {filename}, size={file_size}")
-                            except Exception as size_err:
-                                logging.warning(f"Error getting file size: {str(size_err)}")
                             
-                            # Check for both .pdf and .pdf.processed extensions
-                            if filename.lower().endswith('.pdf') or filename.lower().endswith('.pdf.processed'):
+                            # Check for .pdf extensions
+                            if filename.lower().endswith('.pdf'):
                                 final_check_pdfs.append(file_path)
                                 logging.warning(f"PDF still present in final check: {file_path}")
                 except Exception as check_err:
                     logging.error(f"Error in final check for PDFs: {str(check_err)}")
                 
-                # Only move the folder if no PDFs remain or were detected in final check
+                # Only move the folder if no PDFs remain
                 if all_pdfs_deleted and not final_check_pdfs:
                     logging.info(f"Verified no PDFs remain in folder. Moving to output directory.")
                     dest_folder = self._move_folder(folder_path)
@@ -681,11 +661,6 @@ class PDFProcessor:
                     src_item = os.path.join(folder_path, item)
                     dest_item = os.path.join(dest_folder, item)
                     
-                    # Skip processed files that we couldn't delete
-                    if src_item.endswith(".processed"):
-                        logging.info(f"Skipping already processed file: {src_item}")
-                        continue
-                        
                     # rename if needed to avoid conflicts
                     if os.path.exists(dest_item):
                         base, ext = os.path.splitext(item)
