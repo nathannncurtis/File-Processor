@@ -19,6 +19,9 @@ import traceback
 # make PIL handle broken images better
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+# GPU acceleration detection and setup (will be initialized after logging setup)
+GPU_AVAILABLE = False
+
 # setup basic logging
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +31,17 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout)
     ]
 )
+
+# Initialize GPU acceleration after logging is set up
+try:
+    if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+        GPU_AVAILABLE = True
+        logging.info(f"GPU acceleration available: {cv2.cuda.getCudaEnabledDeviceCount()} CUDA device(s) detected")
+    else:
+        logging.info("No CUDA devices detected, using CPU processing")
+except Exception as e:
+    logging.info(f"GPU acceleration not available: {str(e)}, using CPU processing")
+    GPU_AVAILABLE = False
 
 def check_folder_stability(folder_path):
     """
@@ -132,6 +146,131 @@ def resize_image_inplace(file_path, target_width=1700, target_height=2200, targe
                 return False
     return False
 
+def gpu_adaptive_threshold(img_array, use_gpu=True):
+    """Apply adaptive thresholding with GPU acceleration if available"""
+    global GPU_AVAILABLE
+    
+    if use_gpu and GPU_AVAILABLE:
+        try:
+            # Upload to GPU
+            gpu_img = cv2.cuda_GpuMat()
+            gpu_img.upload(img_array)
+            
+            # Apply adaptive threshold on GPU
+            gpu_result = cv2.cuda.adaptiveThreshold(gpu_img, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, 5)
+            
+            # Download result
+            result = gpu_result.download()
+            
+            # Clean up GPU memory
+            gpu_img.release()
+            gpu_result.release()
+            
+            return result
+        except Exception as e:
+            logging.warning(f"GPU adaptive threshold failed, falling back to CPU: {str(e)}")
+            # Fall through to CPU processing
+    
+    # CPU fallback
+    return cv2.adaptiveThreshold(img_array, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, 5)
+
+def gpu_resize(img_array, new_size, use_gpu=True):
+    """Resize image with GPU acceleration if available"""
+    global GPU_AVAILABLE
+    
+    if use_gpu and GPU_AVAILABLE:
+        try:
+            # Upload to GPU
+            gpu_img = cv2.cuda_GpuMat()
+            gpu_img.upload(img_array)
+            
+            # Resize on GPU
+            gpu_result = cv2.cuda.resize(gpu_img, new_size, interpolation=cv2.INTER_LANCZOS4)
+            
+            # Download result
+            result = gpu_result.download()
+            
+            # Clean up GPU memory
+            gpu_img.release()
+            gpu_result.release()
+            
+            return result
+        except Exception as e:
+            logging.warning(f"GPU resize failed, falling back to CPU: {str(e)}")
+            # Fall through to CPU processing
+    
+    # CPU fallback
+    return cv2.resize(img_array, new_size, interpolation=cv2.INTER_LANCZOS4)
+
+def gpu_threshold(img_array, thresh_val, max_val, thresh_type, use_gpu=True):
+    """Apply threshold with GPU acceleration if available"""
+    global GPU_AVAILABLE
+    
+    if use_gpu and GPU_AVAILABLE:
+        try:
+            # Upload to GPU
+            gpu_img = cv2.cuda_GpuMat()
+            gpu_img.upload(img_array)
+            
+            # Apply threshold on GPU
+            gpu_result = cv2.cuda.threshold(gpu_img, thresh_val, max_val, thresh_type)[1]
+            
+            # Download result
+            result = gpu_result.download()
+            
+            # Clean up GPU memory
+            gpu_img.release()
+            gpu_result.release()
+            
+            return result
+        except Exception as e:
+            logging.warning(f"GPU threshold failed, falling back to CPU: {str(e)}")
+            # Fall through to CPU processing
+    
+    # CPU fallback
+    return cv2.threshold(img_array, thresh_val, max_val, thresh_type)[1]
+
+def gpu_process_image_pipeline(img_array, target_size=None, is_dark=False, use_gpu=True):
+    """Process entire image pipeline on GPU to minimize transfers"""
+    global GPU_AVAILABLE
+    
+    if use_gpu and GPU_AVAILABLE:
+        try:
+            # Upload to GPU once
+            gpu_img = cv2.cuda_GpuMat()
+            gpu_img.upload(img_array)
+            
+            # Resize on GPU if needed
+            if target_size is not None:
+                gpu_img = cv2.cuda.resize(gpu_img, target_size, interpolation=cv2.INTER_LANCZOS4)
+            
+            # Apply thresholding on GPU
+            if is_dark:
+                gpu_result = cv2.cuda.threshold(gpu_img, 40, 255, cv2.THRESH_BINARY)[1]
+            else:
+                gpu_result = cv2.cuda.adaptiveThreshold(gpu_img, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, 5)
+            
+            # Download final result
+            result = gpu_result.download()
+            
+            # Clean up GPU memory
+            gpu_img.release()
+            gpu_result.release()
+            
+            return result
+        except Exception as e:
+            logging.warning(f"GPU pipeline processing failed, falling back to CPU: {str(e)}")
+            # Fall through to CPU processing
+    
+    # CPU fallback - process entire pipeline
+    if target_size is not None:
+        img_array = cv2.resize(img_array, target_size, interpolation=cv2.INTER_LANCZOS4)
+    
+    if is_dark:
+        return cv2.threshold(img_array, 40, 255, cv2.THRESH_BINARY)[1]
+    else:
+        return cv2.adaptiveThreshold(img_array, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, 5)
+
 def parse_args():
     parser = argparse.ArgumentParser(description="TIFF Processor for PDFs and JPEGs")
     parser.add_argument('--watch-dir', required=True, help='Directory to watch for PDF/JPEG folders')
@@ -154,23 +293,80 @@ class PDFProcessor:
         self.folder_locks = {}  # for per-folder locks
 
     def _validate_tiff(self, file_path):
-        """check if tiff file is valid and can be opened"""
+        """check if tiff file is valid and can be opened with write completion verification"""
         try:
-            # first check basics - file exists and has size
-            if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
-                logging.error(f"TIFF file {file_path} is empty or doesn't exist")
-                return False
+            # Wait for file write completion with multiple checks
+            max_wait_attempts = 10
+            wait_interval = 0.5
+            
+            for attempt in range(max_wait_attempts):
+                # Check if file exists
+                if not os.path.exists(file_path):
+                    if attempt < max_wait_attempts - 1:
+                        time.sleep(wait_interval)
+                        continue
+                    else:
+                        logging.error(f"TIFF file {file_path} doesn't exist after {max_wait_attempts} attempts")
+                        return False
                 
-            # try opening the file to make sure it's usable
-            with Image.open(file_path) as img:
-                img.verify()  # verify instead of load to catch corrupted data
-                # make sure it's actually a tiff
-                if img.format != "TIFF":
-                    logging.error(f"File {file_path} is not a valid TIFF format")
-                    return False
-            return True
+                # Check file size
+                try:
+                    file_size = os.path.getsize(file_path)
+                    if file_size == 0:
+                        if attempt < max_wait_attempts - 1:
+                            time.sleep(wait_interval)
+                            continue
+                        else:
+                            logging.error(f"TIFF file {file_path} is empty after {max_wait_attempts} attempts")
+                            return False
+                    
+                    # Check if file size is stable (write completed)
+                    time.sleep(0.1)  # Brief pause
+                    stable_size = os.path.getsize(file_path)
+                    if file_size != stable_size:
+                        if attempt < max_wait_attempts - 1:
+                            time.sleep(wait_interval)
+                            continue
+                        else:
+                            logging.error(f"TIFF file {file_path} still being written after {max_wait_attempts} attempts")
+                            return False
+                            
+                except OSError as e:
+                    if attempt < max_wait_attempts - 1:
+                        time.sleep(wait_interval)
+                        continue
+                    else:
+                        logging.error(f"Cannot access TIFF file {file_path}: {str(e)}")
+                        return False
+                
+                # File exists and has stable size, break out of wait loop
+                break
+                
+            # Additional validation delay to ensure write handles are released
+            time.sleep(0.2)
+            
+            # Try opening the file multiple times with retries
+            validation_attempts = 3
+            for val_attempt in range(validation_attempts):
+                try:
+                    with Image.open(file_path) as img:
+                        img.verify()  # verify instead of load to catch corrupted data
+                        # make sure it's actually a tiff
+                        if img.format != "TIFF":
+                            logging.error(f"File {file_path} is not a valid TIFF format")
+                            return False
+                    return True
+                except Exception as e:
+                    if val_attempt < validation_attempts - 1:
+                        logging.warning(f"TIFF validation attempt {val_attempt + 1} failed for {file_path}: {str(e)}, retrying...")
+                        time.sleep(0.3)
+                        continue
+                    else:
+                        logging.error(f"Invalid TIFF file {file_path} after {validation_attempts} attempts: {str(e)}")
+                        return False
+                        
         except Exception as e:
-            logging.error(f"Invalid TIFF file {file_path}: {str(e)}")
+            logging.error(f"TIFF validation error for {file_path}: {str(e)}")
             return False
 
     def _safe_remove(self, file_path, max_retries=3, retry_delay=1):
@@ -224,7 +420,12 @@ class PDFProcessor:
                     # This shouldn't happen with the new approach, but keep as fallback
                     raise ValueError("Page object processing failed - should use byte data instead")
             
-            # Resize if needed - do it in memory, no temp files
+            # Check if the page is predominantly dark before processing
+            avg_brightness = np.mean(img)
+            is_dark_page = avg_brightness < 50
+            
+            # Determine target size if resizing is needed
+            target_size = None
             if should_resize:
                 # Get current dimensions
                 height, width = img.shape
@@ -242,9 +443,13 @@ class PDFProcessor:
                 scale = min(target_width / width, target_height / height)
                 new_width = int(width * scale)
                 new_height = int(height * scale)
+                target_size = (new_width, new_height)
                 
-                # Resize directly in memory
-                img = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
+                if is_dark_page:
+                    logging.info(f"Detected predominantly dark page, using special processing")
+                
+                # Use GPU pipeline for resize + threshold in one GPU upload/download
+                resized_binary = gpu_process_image_pipeline(img, target_size, is_dark_page)
                 
                 # Create final image with padding
                 final_img = np.full((target_height, target_width), 255, dtype=np.uint8)  # White background
@@ -254,20 +459,17 @@ class PDFProcessor:
                 x_offset = (target_width - new_width) // 2
                 
                 # Place resized image in center
-                final_img[y_offset:y_offset+new_height, x_offset:x_offset+new_width] = img
+                final_img[y_offset:y_offset+new_height, x_offset:x_offset+new_width] = resized_binary
                 
-                # Update img to the final resized version
-                img = final_img
-            
-            # Check if the page is predominantly dark
-            avg_brightness = np.mean(img)
-            is_dark_page = avg_brightness < 50
-            
-            if is_dark_page:
-                logging.info(f"Detected predominantly dark page, using special processing")
-                _, binary = cv2.threshold(img, 40, 255, cv2.THRESH_BINARY)
+                # Update binary to the final padded version
+                binary = final_img
             else:
-                binary = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, 5)
+                # No resize needed, just apply thresholding
+                if is_dark_page:
+                    logging.info(f"Detected predominantly dark page, using special processing")
+                    binary = gpu_threshold(img, 40, 255, cv2.THRESH_BINARY)
+                else:
+                    binary = gpu_adaptive_threshold(img)
             
             # Free memory
             img = None
@@ -276,12 +478,28 @@ class PDFProcessor:
             binary_img = Image.fromarray(binary).convert('1')
             binary = None
             
-            # save with group4 compression
-            binary_img.save(output_path, "TIFF", compression="group4", dpi=(self.dpi, self.dpi))
+            # Create temporary file first to avoid race conditions
+            temp_output = output_path + ".tmp"
+            
+            # save with group4 compression to temp file
+            binary_img.save(temp_output, "TIFF", compression="group4", dpi=(self.dpi, self.dpi))
             binary_img = None
             
             # Force garbage collection
             gc.collect()
+            
+            # Brief delay to ensure write completion
+            time.sleep(0.05)
+            
+            # Atomically move temp file to final location
+            try:
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                shutil.move(temp_output, output_path)
+            except Exception as e:
+                if os.path.exists(temp_output):
+                    os.remove(temp_output)
+                raise e
             
             # verify the tiff is good
             if not self._validate_tiff(output_path):
@@ -312,12 +530,24 @@ class PDFProcessor:
                 
             # Check if output already exists in a valid form
             if os.path.exists(output_path):
-                if self._validate_tiff(output_path):
-                    logging.info(f"Valid TIFF already exists at {output_path}, skipping conversion")
-                    return True
-                else:
-                    # Remove invalid output file
-                    logging.warning(f"Removing invalid existing TIFF: {output_path}")
+                # Check file size first - if it's 0 bytes, remove it
+                try:
+                    existing_size = os.path.getsize(output_path)
+                    if existing_size == 0:
+                        logging.warning(f"Removing empty TIFF file: {output_path}")
+                        self._safe_remove(output_path)
+                    elif existing_size < 100:  # TIFF files should be at least 100 bytes
+                        logging.warning(f"Removing suspiciously small TIFF file ({existing_size} bytes): {output_path}")
+                        self._safe_remove(output_path)
+                    elif self._validate_tiff(output_path):
+                        logging.info(f"Valid TIFF already exists at {output_path}, skipping conversion")
+                        return True
+                    else:
+                        # Remove invalid output file
+                        logging.warning(f"Removing invalid existing TIFF: {output_path}")
+                        self._safe_remove(output_path)
+                except OSError as e:
+                    logging.warning(f"Error checking existing TIFF file {output_path}: {str(e)}")
                     self._safe_remove(output_path)
             
             # Load and process image entirely in memory
@@ -372,19 +602,34 @@ class PDFProcessor:
             
             if is_dark_image:
                 logging.info(f"Detected predominantly dark JPEG, using special processing")
-                _, binary = cv2.threshold(img_array, 40, 255, cv2.THRESH_BINARY)
+                binary = gpu_threshold(img_array, 40, 255, cv2.THRESH_BINARY)
             else:
-                binary = cv2.adaptiveThreshold(img_array, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 15, 5)
+                binary = gpu_adaptive_threshold(img_array)
             
-            # Convert to PIL and save directly (no temp file)
+            # Convert to PIL and save to temp file first
             binary_img = Image.fromarray(binary).convert('1')
-            binary_img.save(output_path, "TIFF", compression="group4", dpi=(self.dpi, self.dpi))
+            temp_output = output_path + ".tmp"
+            
+            binary_img.save(temp_output, "TIFF", compression="group4", dpi=(self.dpi, self.dpi))
             
             # Clean up memory
             img_array = None
             binary = None
             binary_img = None
             gc.collect()
+            
+            # Brief delay to ensure write completion
+            time.sleep(0.05)
+            
+            # Atomically move temp file to final location
+            try:
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                shutil.move(temp_output, output_path)
+            except Exception as e:
+                if os.path.exists(temp_output):
+                    os.remove(temp_output)
+                raise e
             
             # Validate the final output
             if not self._validate_tiff(output_path):
@@ -418,22 +663,39 @@ class PDFProcessor:
                 
                 # Check if output already exists (from a previous run)
                 output_path = jpeg_path.rsplit('.', 1)[0] + '.tif'
-                if os.path.exists(output_path) and self._validate_tiff(output_path):
-                    logging.info(f"TIFF already exists and is valid, skipping conversion: {output_path}")
-                    # Still count this as a success
-                    with self.lock:
-                        self.success_count += 1
-                    
-                    # CRITICAL: Force handle release before attempting deletion
-                    gc.collect()
-                    time.sleep(0.5)  # Give time for handles to release
-                    
-                    # Remove the JPEG since TIFF already exists
-                    removal_success = self._safe_remove_with_retries(jpeg_path, max_retries=5, retry_delay=2)
-                    if not removal_success:
-                        logging.error(f"CRITICAL: Failed to remove JPEG after validation: {jpeg_path}")
-                        return False
-                    return True
+                if os.path.exists(output_path):
+                    # Check file size first - if it's 0 bytes, remove it
+                    try:
+                        existing_size = os.path.getsize(output_path)
+                        if existing_size == 0:
+                            logging.warning(f"Removing empty TIFF file: {output_path}")
+                            self._safe_remove(output_path)
+                        elif existing_size < 100:  # TIFF files should be at least 100 bytes
+                            logging.warning(f"Removing suspiciously small TIFF file ({existing_size} bytes): {output_path}")
+                            self._safe_remove(output_path)
+                        elif self._validate_tiff(output_path):
+                            logging.info(f"TIFF already exists and is valid, skipping conversion: {output_path}")
+                            # Still count this as a success
+                            with self.lock:
+                                self.success_count += 1
+                            
+                            # CRITICAL: Force handle release before attempting deletion
+                            gc.collect()
+                            time.sleep(0.5)  # Give time for handles to release
+                            
+                            # Remove the JPEG since TIFF already exists
+                            removal_success = self._safe_remove_with_retries(jpeg_path, max_retries=5, retry_delay=2)
+                            if not removal_success:
+                                logging.error(f"CRITICAL: Failed to remove JPEG after validation: {jpeg_path}")
+                                return False
+                            return True
+                        else:
+                            # Remove invalid output file
+                            logging.warning(f"Removing invalid existing TIFF: {output_path}")
+                            self._safe_remove(output_path)
+                    except OSError as e:
+                        logging.warning(f"Error checking existing TIFF file {output_path}: {str(e)}")
+                        self._safe_remove(output_path)
                 
                 # Attempt conversion with retries
                 attempt = 0
@@ -488,17 +750,24 @@ class PDFProcessor:
                 return False
 
     def _convert_page_with_retries(self, page_data, output_path, page_num, total_pages, should_resize=True):
-        """Process a single page with infinite retries using page data (bytes) instead of page object"""
+        """Process a single page with intelligent retries using page data (bytes) instead of page object"""
         attempt = 0
+        max_attempts = 10  # Limit retries to prevent infinite loops
         
-        # infinite retry loop - never give up on a page
-        while True:
+        while attempt < max_attempts:
             attempt += 1
             if attempt > 1:
-                logging.warning(f"retry attempt {attempt} for page {page_num} of {total_pages}")
-                time.sleep(1)  # brief pause before retry
+                # Progressive delay: longer waits for more attempts
+                delay = min(attempt * 0.5, 3.0)  # 0.5s, 1s, 1.5s, 2s, 2.5s, 3s, 3s...
+                logging.warning(f"retry attempt {attempt} for page {page_num} of {total_pages}, waiting {delay}s")
+                time.sleep(delay)
             
             try:
+                # Clean up any existing partial file
+                if os.path.exists(output_path):
+                    self._safe_remove(output_path)
+                    time.sleep(0.1)  # Brief pause after cleanup
+                
                 # process the page using page data (pass bytes directly)
                 page_success = self._convert_page(page_data, output_path, should_resize)
                 
@@ -508,10 +777,18 @@ class PDFProcessor:
                     return True
                 else:
                     logging.warning(f"failed attempt {attempt} for page {page_num}")
+                    # Clean up failed attempt
+                    if os.path.exists(output_path):
+                        self._safe_remove(output_path)
+                        
             except Exception as e:
                 logging.error(f"error on attempt {attempt} for page {page_num}: {str(e)}")
+                # Clean up failed attempt
+                if os.path.exists(output_path):
+                    self._safe_remove(output_path)
         
-        # This line should never be reached because the loop only exits with a return
+        # All attempts failed
+        logging.error(f"CRITICAL: Page {page_num} failed after {max_attempts} attempts")
         return False
 
     def process_pdf(self, pdf_path):
@@ -547,7 +824,7 @@ class PDFProcessor:
                 logging.info(f"processing pdf: {pdf_path} ({total_pages} pages)")
                 
                 # Process in chunks of 10,000 pages
-                chunk_size = 10000
+                chunk_size = 250
                 max_workers = min(os.cpu_count() or 4, 4)
                 
                 for chunk_start in range(0, total_pages, chunk_size):
@@ -722,6 +999,8 @@ class PDFProcessor:
             
         # Lock this folder for exclusive access
         with self.folder_locks[folder_path]:
+            self.processed_folders.add(folder_path)
+
             try:
                 # check folder still exists
                 if not os.path.exists(folder_path):
@@ -813,53 +1092,228 @@ class PDFProcessor:
                     # Additional wait to release any lingering handles from PDF processing
                     time.sleep(1)
 
-                # Process JPEGs with chunked processing to avoid memory issues
+                # Process JPEGs with batch reading to improve I/O efficiency
                 jpeg_files = [f for f in os.listdir(folder_path) 
                             if f.lower().endswith(('.jpg', '.jpeg'))]
                 
                 if jpeg_files:
-                    logging.info(f"Processing {len(jpeg_files)} JPEG files in chunks to avoid memory issues")
+                    logging.info(f"Processing {len(jpeg_files)} JPEG files with batch reading (250 per batch)")
                     
                     jpeg_results = []
                     processed_jpegs = set()
-                    jpeg_chunk_size = 1000  # Process 1000 JPEGs at a time
+                    batch_size = 250  # Read 250 JPEGs per batch
                     
-                    # Process JPEGs in chunks
-                    for chunk_start in range(0, len(jpeg_files), jpeg_chunk_size):
-                        chunk_end = min(chunk_start + jpeg_chunk_size, len(jpeg_files))
-                        jpeg_chunk = jpeg_files[chunk_start:chunk_end]
-                        chunk_num = (chunk_start // jpeg_chunk_size) + 1
-                        total_chunks = ((len(jpeg_files) + jpeg_chunk_size - 1) // jpeg_chunk_size)
+                    # Process JPEGs in batches
+                    for batch_start in range(0, len(jpeg_files), batch_size):
+                        batch_end = min(batch_start + batch_size, len(jpeg_files))
+                        jpeg_batch = jpeg_files[batch_start:batch_end]
+                        batch_num = (batch_start // batch_size) + 1
+                        total_batches = ((len(jpeg_files) + batch_size - 1) // batch_size)
                         
-                        logging.info(f"Processing JPEG chunk {chunk_num}/{total_chunks}: files {chunk_start+1}-{chunk_end}")
+                        logging.info(f"Processing JPEG batch {batch_num}/{total_batches}: files {batch_start+1}-{batch_end}")
                         
-                        # Process this chunk sequentially
-                        for jpeg_file in jpeg_chunk:
+                        # Batch read: Load all JPEGs in this batch into memory
+                        batch_images = []
+                        batch_paths = []
+                        batch_output_paths = []
+                        
+                        for jpeg_file in jpeg_batch:
                             jpeg_path = os.path.join(folder_path, jpeg_file)
+                            output_path = jpeg_path.rsplit('.', 1)[0] + '.tif'
                             
+                            try:
+                                # Load JPEG into memory
+                                with Image.open(jpeg_path) as img:
+                                    # Convert to RGB if not already and copy to break file handle dependency
+                                    if img.mode != 'RGB':
+                                        img_copy = img.convert('RGB').copy()
+                                    else:
+                                        img_copy = img.copy()
+                                    
+                                batch_images.append(img_copy)
+                                batch_paths.append(jpeg_path)
+                                batch_output_paths.append(output_path)
+                                
+                            except Exception as e:
+                                logging.error(f"Failed to load JPEG {jpeg_path}: {str(e)}")
+                                batch_images.append(None)
+                                batch_paths.append(jpeg_path)
+                                batch_output_paths.append(output_path)
+                        
+                        logging.info(f"Loaded {len([img for img in batch_images if img is not None])}/{len(jpeg_batch)} JPEGs into memory")
+                        
+                        # Batch process: Convert all loaded images
+                        batch_results = []
+                        for i, (img, jpeg_path, output_path) in enumerate(zip(batch_images, batch_paths, batch_output_paths)):
+                            if img is None:
+                                batch_results.append(False)
+                                continue
+                                
                             # Skip if already processed (shouldn't happen but safety check)
+                            jpeg_file = os.path.basename(jpeg_path)
                             if jpeg_file in processed_jpegs:
                                 logging.warning(f"JPEG {jpeg_file} already processed, skipping")
+                                batch_results.append(True)
                                 continue
                             
-                            result = self.process_jpeg(jpeg_path)
-                            jpeg_results.append(result)
-                            processed_jpegs.add(jpeg_file)
-                            
-                            # Log progress within chunk (every 100 files)
-                            if len(processed_jpegs) % 100 == 0:
-                                logging.info(f"Processed {len(processed_jpegs)}/{len(jpeg_files)} JPEGs")
+                            try:
+                                # Check if folder wants resizing
+                                folder_name = os.path.basename(os.path.dirname(jpeg_path))
+                                should_resize = not folder_name.lower().endswith('--noresize')
+                                
+                                # Check if output already exists (from a previous run)
+                                if os.path.exists(output_path):
+                                    # Check file size first - if it's 0 bytes, remove it
+                                    try:
+                                        existing_size = os.path.getsize(output_path)
+                                        if existing_size == 0:
+                                            logging.warning(f"Removing empty TIFF file: {output_path}")
+                                            self._safe_remove(output_path)
+                                        elif existing_size < 100:  # TIFF files should be at least 100 bytes
+                                            logging.warning(f"Removing suspiciously small TIFF file ({existing_size} bytes): {output_path}")
+                                            self._safe_remove(output_path)
+                                        elif self._validate_tiff(output_path):
+                                            logging.info(f"TIFF already exists and is valid, skipping conversion: {output_path}")
+                                            with self.lock:
+                                                self.success_count += 1
+                                            batch_results.append(True)
+                                            processed_jpegs.add(jpeg_file)
+                                            continue
+                                        else:
+                                            # Remove invalid output file
+                                            logging.warning(f"Removing invalid existing TIFF: {output_path}")
+                                            self._safe_remove(output_path)
+                                    except OSError as e:
+                                        logging.warning(f"Error checking existing TIFF file {output_path}: {str(e)}")
+                                        self._safe_remove(output_path)
+                                
+                                # Process the in-memory image (similar to existing _convert_jpeg_to_tiff logic)
+                                # Handle resizing in memory if needed
+                                if should_resize:
+                                    original_width, original_height = img.size
+                                    original_is_landscape = original_width > original_height
+                                    
+                                    # Set target dimensions based on orientation
+                                    target_width = 1700
+                                    target_height = 2200
+                                    if original_is_landscape and target_width < target_height:
+                                        target_width, target_height = target_height, target_width
+                                    elif not original_is_landscape and target_width > target_height:
+                                        target_width, target_height = target_height, target_width
+                                    
+                                    # Calculate scaling
+                                    scale = min(target_width / original_width, target_height / original_height)
+                                    new_width = int(original_width * scale)
+                                    new_height = int(original_height * scale)
+                                    
+                                    # Resize image in memory
+                                    img = img.resize((new_width, new_height), Image.LANCZOS)
+                                    
+                                    # Create final image with white background
+                                    final_img = Image.new('RGB', (target_width, target_height), 'white')
+                                    
+                                    # Calculate centering offsets
+                                    x_offset = (target_width - new_width) // 2
+                                    y_offset = (target_height - new_height) // 2
+                                    
+                                    # Paste resized image in center
+                                    final_img.paste(img, (x_offset, y_offset))
+                                    
+                                    # Update img to the final resized version
+                                    img = final_img
+                                
+                                # Convert to grayscale for OpenCV processing
+                                img = img.convert('L')
+                                
+                                # Convert PIL image to numpy array for OpenCV
+                                img_array = np.array(img)
+                                
+                                # Process with OpenCV thresholding
+                                avg_brightness = np.mean(img_array)
+                                is_dark_image = avg_brightness < 50
+                                
+                                if is_dark_image:
+                                    logging.info(f"Detected predominantly dark JPEG, using special processing")
+                                    binary = gpu_threshold(img_array, 40, 255, cv2.THRESH_BINARY)
+                                else:
+                                    binary = gpu_adaptive_threshold(img_array)
+                                
+                                # Convert to PIL and save to temp file first
+                                binary_img = Image.fromarray(binary).convert('1')
+                                temp_output = output_path + ".tmp"
+                                
+                                binary_img.save(temp_output, "TIFF", compression="group4", dpi=(self.dpi, self.dpi))
+                                
+                                # Brief delay to ensure write completion
+                                time.sleep(0.05)
+                                
+                                # Atomically move temp file to final location
+                                try:
+                                    if os.path.exists(output_path):
+                                        os.remove(output_path)
+                                    shutil.move(temp_output, output_path)
+                                except Exception as e:
+                                    if os.path.exists(temp_output):
+                                        os.remove(temp_output)
+                                    raise e
+                                
+                                # Validate the final output
+                                if not self._validate_tiff(output_path):
+                                    raise ValueError("TIFF validation failed")
+                                
+                                # Success
+                                with self.lock:
+                                    self.success_count += 1
+                                batch_results.append(True)
+                                processed_jpegs.add(jpeg_file)
+                                
+                                # Clean up memory for this image
+                                img_array = None
+                                binary = None
+                                binary_img = None
+                                
+                            except Exception as e:
+                                logging.error(f"JPEG to TIFF conversion failed for {jpeg_path}: {str(e)}")
+                                if os.path.exists(output_path):
+                                    self._safe_remove(output_path)
+                                batch_results.append(False)
                         
-                        # Force garbage collection after each chunk
+                        # Now batch delete: Remove all successfully converted JPEGs from this batch
+                        for i, (jpeg_path, result) in enumerate(zip(batch_paths, batch_results)):
+                            if result:
+                                # CRITICAL: Force handle release before attempting deletion
+                                gc.collect()
+                                time.sleep(0.1)
+                                
+                                # Use the robust removal method
+                                removal_success = self._safe_remove_with_retries(jpeg_path, max_retries=5, retry_delay=2)
+                                if not removal_success:
+                                    logging.error(f"CRITICAL: Failed to remove JPEG after successful conversion: {jpeg_path}")
+                        
+                        # Clear batch from memory
+                        batch_images.clear()
+                        batch_images = None
+                        batch_paths = None
+                        batch_output_paths = None
+                        
+                        # Add batch results to overall results
+                        jpeg_results.extend(batch_results)
+                        
+                        # Force garbage collection after each batch
                         gc.collect()
                         
                         # Brief pause to let system catch up
                         time.sleep(0.5)
                         
-                        logging.info(f"Completed JPEG chunk {chunk_num}/{total_chunks}")
+                        # Log progress
+                        logging.info(f"Completed JPEG batch {batch_num}/{total_batches}: {len([r for r in batch_results if r])} successful conversions")
+                        
+                        # Log overall progress
+                        if len(processed_jpegs) % 250 == 0 or batch_num == total_batches:
+                            logging.info(f"Overall progress: {len(processed_jpegs)}/{len(jpeg_files)} JPEGs processed")
                     
                     # Final JPEG processing summary
-                    logging.info(f"Completed all JPEG processing: {len(processed_jpegs)} files processed")
+                    logging.info(f"Completed all JPEG batch processing: {len(processed_jpegs)} files processed")
                 else:
                     # No JPEGs found
                     jpeg_results = []
@@ -995,69 +1449,118 @@ class PDFProcessor:
             logging.error(f"folder move failed: {str(e)}")
             return False
 
-        def _merge_folders(self, src_folder, dest_folder):
-            """merge source folder into destination folder, handling file conflicts"""
-            try:
-                # make sure destination exists
-                if not os.path.exists(dest_folder):
-                    os.makedirs(dest_folder)
-                    
-                # move all files from source to destination
-                for item in os.listdir(src_folder):
-                    src_item = os.path.join(src_folder, item)
-                    dest_item = os.path.join(dest_folder, item)
-                    
-                    if os.path.isdir(src_item):
-                        # recursively merge subdirectories
-                        self._merge_folders(src_item, dest_item)
+    def _merge_folders(self, src_folder, dest_folder):
+        """merge source folder into destination folder, handling file conflicts"""
+        try:
+            # make sure destination exists
+            if not os.path.exists(dest_folder):
+                os.makedirs(dest_folder)
+                
+            # move all files from source to destination
+            for item in os.listdir(src_folder):
+                src_item = os.path.join(src_folder, item)
+                dest_item = os.path.join(dest_folder, item)
+                
+                if os.path.isdir(src_item):
+                    # recursively merge subdirectories
+                    self._merge_folders(src_item, dest_item)
+                else:
+                    # handle file conflict by renaming if needed
+                    if os.path.exists(dest_item):
+                        # rename by adding counter suffix
+                        base, ext = os.path.splitext(item)
+                        counter = 1
+                        new_dest_item = dest_item
+                        while os.path.exists(new_dest_item):
+                            new_name = f"{base}_{counter}{ext}"
+                            new_dest_item = os.path.join(dest_folder, new_name)
+                            counter += 1
+                        
+                        # move with new name
+                        shutil.move(src_item, new_dest_item)
+                        logging.info(f"renamed and moved file: {src_item} -> {new_dest_item}")
                     else:
-                        # handle file conflict by renaming if needed
-                        if os.path.exists(dest_item):
-                            # rename by adding counter suffix
-                            base, ext = os.path.splitext(item)
-                            counter = 1
-                            new_dest_item = dest_item
-                            while os.path.exists(new_dest_item):
-                                new_name = f"{base}_{counter}{ext}"
-                                new_dest_item = os.path.join(dest_folder, new_name)
-                                counter += 1
-                            
-                            # move with new name
-                            shutil.move(src_item, new_dest_item)
-                            logging.info(f"renamed and moved file: {src_item} -> {new_dest_item}")
-                        else:
-                            # move file directly
-                            shutil.move(src_item, dest_item)
-                            logging.info(f"moved file: {src_item} -> {dest_item}")
-                
-                # remove source folder after all items have been moved
-                if os.path.exists(src_folder) and len(os.listdir(src_folder)) == 0:
-                    os.rmdir(src_folder)
-                    logging.info(f"removed empty source folder: {src_folder}")
-                
-                return True
-            except Exception as e:
-                logging.error(f"folder merge failed: {str(e)}")
-                return False
+                        # move file directly
+                        shutil.move(src_item, dest_item)
+                        logging.info(f"moved file: {src_item} -> {dest_item}")
+            
+            # remove source folder after all items have been moved
+            if os.path.exists(src_folder) and len(os.listdir(src_folder)) == 0:
+                os.rmdir(src_folder)
+                logging.info(f"removed empty source folder: {src_folder}")
+            
+            return True
+        except Exception as e:
+            logging.error(f"folder merge failed: {str(e)}")
+            return False
 
 class FolderHandler(FileSystemEventHandler):
     def __init__(self, processor):
         self.processor = processor
         self.processing_set = set()  # track folders being processed
+        self.processing_timestamps = {}  # track when folders started processing
+
+    def _cleanup_stale_processing(self):
+        """Remove folders from processing set that have been processing for more than 2 minutes"""
+        current_time = time.time()
+        timeout_threshold = 120  # 2 minutes in seconds
+        stale_folders = []
+        
+        for folder_path in list(self.processing_set):
+            start_time = self.processing_timestamps.get(folder_path, current_time)
+            if current_time - start_time > timeout_threshold:
+                stale_folders.append(folder_path)
+        
+        for folder_path in stale_folders:
+            logging.warning(f"Removing stale folder from processing set after 2 minutes: {folder_path}")
+            self.processing_set.discard(folder_path)
+            self.processing_timestamps.pop(folder_path, None)
+
+    def _is_recently_processed(self, folder_path, time_window=10):
+        """Check if folder was processed within time_window seconds"""
+        folder_name = os.path.basename(folder_path)
+        # Strip --noresize suffix if present (case insensitive)
+        if folder_name.lower().endswith('--noresize'):
+            clean_name = folder_name[:-10]
+        else:
+            clean_name = folder_name
+            
+        dest_folder = os.path.join(self.processor.output_directory, clean_name)
+        
+        if os.path.exists(dest_folder):
+            # Check if destination was created recently
+            dest_mtime = os.path.getmtime(dest_folder)
+            if time.time() - dest_mtime < time_window:
+                return True
+        return False
 
     def on_created(self, event):
         if event.is_directory:
             folder_path = event.src_path
             
+            # Clean up stale folders from processing set
+            self._cleanup_stale_processing()
+            
+            # Check if recently processed first (before any other checks)
+            if self._is_recently_processed(folder_path):
+                logging.info(f"Folder recently processed, ignoring: {folder_path}")
+                return
+            
             # avoid processing same folder multiple times
             if folder_path in self.processing_set:
                 logging.info(f"folder already being processed: {folder_path}")
                 return
+            
+            # Check if already marked as processed
+            if folder_path in self.processor.processed_folders:
+                logging.info(f"folder already in processed set, ignoring: {folder_path}")
+                return
                 
             logging.info(f"New folder detected: {folder_path}")
             
-            # add to processing set
+            # add to processing set with timestamp
             self.processing_set.add(folder_path)
+            self.processing_timestamps[folder_path] = time.time()
             
             try:
                 # run stability check if needed (will retry until stable)
@@ -1070,10 +1573,6 @@ class FolderHandler(FileSystemEventHandler):
                     self.processor.stable_folders.add(folder_path)
                     logging.info(f"Folder verified as stable and queued: {folder_path}")
                 
-                # reset if folder gets recreated
-                if folder_path in self.processor.processed_folders:
-                    self.processor.processed_folders.remove(folder_path)
-                
                 # process the folder
                 self.processor.process_folder(folder_path)
             except Exception as e:
@@ -1082,14 +1581,28 @@ class FolderHandler(FileSystemEventHandler):
             finally:
                 # always clean up processing set
                 self.processing_set.discard(folder_path)
+                self.processing_timestamps.pop(folder_path, None)
 
     def on_modified(self, event):
         if event.is_directory:
             folder_path = event.src_path
             
+            # Clean up stale folders from processing set
+            self._cleanup_stale_processing()
+            
+            # Check if recently processed first (before any other checks)
+            if self._is_recently_processed(folder_path):
+                logging.info(f"Folder recently processed, ignoring modification: {folder_path}")
+                return
+            
             # avoid processing same folder multiple times
             if folder_path in self.processing_set:
                 logging.info(f"folder already being processed: {folder_path}")
+                return
+            
+            # Check if already marked as processed
+            if folder_path in self.processor.processed_folders:
+                logging.info(f"folder already in processed set, ignoring modification: {folder_path}")
                 return
                 
             # check if it contains files we process
@@ -1108,8 +1621,9 @@ class FolderHandler(FileSystemEventHandler):
                 
             logging.info(f"Folder modified with processable files: {folder_path}")
             
-            # add to processing set
+            # add to processing set with timestamp
             self.processing_set.add(folder_path)
+            self.processing_timestamps[folder_path] = time.time()
             
             try:
                 # remove from stable folders if it was previously marked stable
@@ -1124,10 +1638,6 @@ class FolderHandler(FileSystemEventHandler):
                 # mark as stable
                 self.processor.stable_folders.add(folder_path)
                 
-                # reset if folder is modified with new files
-                if folder_path in self.processor.processed_folders:
-                    self.processor.processed_folders.remove(folder_path)
-                
                 # process the folder
                 self.processor.process_folder(folder_path)
             except Exception as e:
@@ -1136,6 +1646,7 @@ class FolderHandler(FileSystemEventHandler):
             finally:
                 # always clean up processing set
                 self.processing_set.discard(folder_path)
+                self.processing_timestamps.pop(folder_path, None)
 
 def main():
     args = parse_args()

@@ -311,7 +311,7 @@ class PDFProcessor:
                 pdf_filename = os.path.splitext(os.path.basename(pdf_path))[0]
                 
                 # Process in chunks of 10,000 pages
-                chunk_size = 10000
+                chunk_size = 250
                 max_workers = min(os.cpu_count() or 4, 4)
                 
                 for chunk_start in range(0, total_pages, chunk_size):
@@ -720,9 +720,26 @@ class FolderWatcher(FileSystemEventHandler):
     def __init__(self, processor):
         self.processor = processor
         self.processing_set = set()  # track folders being processed
+        self.processing_timestamps = {}  # track when folders started processing
         self.recently_completed = set()  # track folders that were recently completed
         self.completion_timestamps = {}  # track when folders were completed
         self.lock = threading.Lock()  # lock for thread-safe operations on shared sets
+
+    def _cleanup_stale_processing(self):
+        """Remove folders from processing set that have been processing for more than 2 minutes"""
+        current_time = time.time()
+        timeout_threshold = 120  # 2 minutes in seconds
+        stale_folders = []
+        
+        for folder_path in list(self.processing_set):
+            start_time = self.processing_timestamps.get(folder_path, current_time)
+            if current_time - start_time > timeout_threshold:
+                stale_folders.append(folder_path)
+        
+        for folder_path in stale_folders:
+            logging.warning(f"Removing stale folder from processing set after 2 minutes: {folder_path}")
+            self.processing_set.discard(folder_path)
+            self.processing_timestamps.pop(folder_path, None)
 
     def _cleanup_completed_folders(self):
         """Clean up the recently completed folders set after a time threshold"""
@@ -743,6 +760,9 @@ class FolderWatcher(FileSystemEventHandler):
     def on_created(self, event):
         if event.is_directory:
             folder_path = event.src_path
+            
+            # Clean up stale folders from processing set
+            self._cleanup_stale_processing()
             
             # Clean up old entries in the completed set
             self._cleanup_completed_folders()
@@ -765,8 +785,9 @@ class FolderWatcher(FileSystemEventHandler):
                 
             logging.info(f"New folder detected: {folder_path}")
             
-            # add to processing set
+            # add to processing set with timestamp
             self.processing_set.add(folder_path)
+            self.processing_timestamps[folder_path] = time.time()
             
             try:
                 # run stability check if needed (will retry until stable)
@@ -808,10 +829,14 @@ class FolderWatcher(FileSystemEventHandler):
             finally:
                 # always clean up processing set
                 self.processing_set.discard(folder_path)
+                self.processing_timestamps.pop(folder_path, None)
 
     def on_modified(self, event):
         if event.is_directory:
             folder_path = event.src_path
+            
+            # Clean up stale folders from processing set
+            self._cleanup_stale_processing()
             
             # Clean up old entries in the completed set
             self._cleanup_completed_folders()
@@ -847,8 +872,9 @@ class FolderWatcher(FileSystemEventHandler):
                 
             logging.info(f"Folder modified with PDFs: {folder_path}")
             
-            # add to processing set
+            # add to processing set with timestamp
             self.processing_set.add(folder_path)
+            self.processing_timestamps[folder_path] = time.time()
             
             try:
                 # remove from stable folders if it was previously marked stable
@@ -891,6 +917,7 @@ class FolderWatcher(FileSystemEventHandler):
             finally:
                 # always clean up processing set
                 self.processing_set.discard(folder_path)
+                self.processing_timestamps.pop(folder_path, None)
 
 def main():
     # get args

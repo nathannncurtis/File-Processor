@@ -78,7 +78,18 @@ class JobQueueManager(QThread):
                 # This will be much less frequent now
                 
             except Exception as e:
-                print(f"Error in JobQueueManager run: {e}")
+                # Log the full exception and traceback to prevent silent failures
+                import logging
+                import traceback
+                logging.error(f"Critical error in JobQueueManager main loop: {e}")
+                logging.error(f"Full traceback: {traceback.format_exc()}")
+                print(f"Critical error in JobQueueManager main loop: {e}")
+                print(f"Full traceback: {traceback.format_exc()}")
+                
+                # Sleep for 30 seconds before retrying to prevent rapid error loops
+                print("Sleeping for 30 seconds before retrying...")
+                time.sleep(30)
+                continue
             
             # Longer sleep interval since we're not driving UI updates
             time.sleep(1)

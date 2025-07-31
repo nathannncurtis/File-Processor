@@ -51,10 +51,18 @@ class JobManager:
         self._last_config_save = time.time()
         self._config_lock = threading.Lock()  # Thread safety for config operations
         
+        # File tracking to prevent reprocessing the same files
+        self._processed_files = {}  # file_path -> (modification_time, process_time)
+        self._file_lock = threading.Lock()  # Thread safety for file tracking
+        
+        
         self.load_config()
         
         # Start background config saver
         self._start_config_saver()
+        
+        # Start simple file checker
+        self._start_file_checker()
         
         # log init
         logging.info(f"JobManager initialized with config file: {config_file}")
@@ -82,6 +90,176 @@ class JobManager:
         config_thread = threading.Thread(target=config_save_worker, daemon=True)
         config_thread.start()
         logging.info("Background config saver thread started")
+
+    def _start_file_checker(self):
+        """Start background thread to continuously check for files to process"""
+        def file_check_worker():
+            while True:
+                try:
+                    time.sleep(10)  # Check every 10 seconds
+                    self._check_all_active_profiles()
+                except Exception as e:
+                    logging.error(f"Error in file check worker: {e}")
+                    logging.error(f"File checker continuing despite error...")
+                    # Continue the loop no matter what happens
+                    continue
+        
+        check_thread = threading.Thread(target=file_check_worker, daemon=True)
+        check_thread.start()
+        logging.info("Background file checker thread started")
+
+    def _check_all_active_profiles(self):
+        """Check all active profiles for files to process"""
+        try:
+            active_profiles = []
+            for profile_name, details in self.config.get('profiles', {}).items():
+                try:
+                    # Only check active profiles
+                    if details.get('status') != 'Active':
+                        continue
+                    
+                    active_profiles.append(profile_name)
+                    self._scan_profile_folders(profile_name, details)
+                    
+                except Exception as e:
+                    logging.error(f"Error checking profile {profile_name}: {e}")
+                    logging.error(f"Continuing with next profile...")
+                    continue
+            
+            # Log checker activity every 60 seconds (every 6th check)
+            current_time = time.time()
+            if int(current_time) % 60 < 10:  # Log once per minute
+                with self._file_lock:
+                    tracked_files = len(self._processed_files)
+                logging.info(f"File checker: {len(active_profiles)} active profiles - {', '.join(active_profiles)} (tracking {tracked_files} files)")
+        except Exception as e:
+            logging.error(f"Critical error in _check_all_active_profiles: {e}")
+            logging.error(f"File checker continuing despite critical error...")
+
+    def _scan_profile_folders(self, profile_name, details):
+        """Scan a profile's folders for files to process"""
+        try:
+            folders_to_process = []
+            
+            # Check JPEG folder for PDFs
+            try:
+                jpeg_folder = details.get('JPEG', '')
+                if jpeg_folder and os.path.exists(jpeg_folder):
+                    folders_to_process.extend(self._find_folders_with_new_files(jpeg_folder, '.pdf'))
+            except Exception as e:
+                logging.error(f"Error scanning JPEG folder for profile {profile_name}: {e}")
+            
+            # Check TIFF folder for PDFs and JPEGs
+            try:
+                tiff_folder = details.get('TIFF', '')
+                if tiff_folder and os.path.exists(tiff_folder):
+                    folders_to_process.extend(self._find_folders_with_new_files(tiff_folder, '.pdf'))
+                    folders_to_process.extend(self._find_folders_with_new_files(tiff_folder, '.jpg'))
+                    folders_to_process.extend(self._find_folders_with_new_files(tiff_folder, '.jpeg'))
+            except Exception as e:
+                logging.error(f"Error scanning TIFF folder for profile {profile_name}: {e}")
+            
+            if folders_to_process:
+                logging.info(f"Profile {profile_name} found {len(folders_to_process)} folders with new files to process")
+                
+                # Trigger processing by touching each folder
+                for folder_path in folders_to_process:
+                    try:
+                        self._trigger_folder_processing(folder_path)
+                    except Exception as e:
+                        logging.error(f"Error triggering processing for folder {folder_path}: {e}")
+                        continue
+                    
+        except Exception as e:
+            logging.error(f"Critical error scanning folders for profile {profile_name}: {e}")
+            logging.error(f"Continuing with file checker despite error...")
+
+    def _find_folders_with_new_files(self, base_folder, file_extension):
+        """Recursively find folders containing NEW or MODIFIED files with the specified extension"""
+        folders_with_new_files = []
+        try:
+            for root, dirs, files in os.walk(base_folder):
+                try:
+                    # Check if this directory contains new or modified files with the target extension
+                    has_new_files = False
+                    
+                    for file in files:
+                        if file.lower().endswith(file_extension.lower()):
+                            file_path = os.path.join(root, file)
+                            if self._is_file_new_or_modified(file_path):
+                                has_new_files = True
+                                break
+                    
+                    if has_new_files:
+                        folders_with_new_files.append(root)
+                        
+                except (OSError, PermissionError):
+                    continue  # Skip folders we can't read
+        except (OSError, PermissionError):
+            pass  # Skip if we can't read the base folder
+        
+        return folders_with_new_files
+    
+    def _is_file_new_or_modified(self, file_path):
+        """Check if a file is new or has been modified since last processing"""
+        try:
+            # Get file modification time
+            file_mtime = os.path.getmtime(file_path)
+            current_time = time.time()
+            
+            with self._file_lock:
+                # Check if we've seen this file before
+                if file_path in self._processed_files:
+                    last_mtime, last_process_time = self._processed_files[file_path]
+                    
+                    # If file hasn't been modified since we last processed it, skip it
+                    if file_mtime <= last_mtime:
+                        return False
+                    
+                    # If we processed it very recently (within 30 seconds), skip it
+                    if current_time - last_process_time < 30:
+                        return False
+                
+                # Mark file as being processed now
+                self._processed_files[file_path] = (file_mtime, current_time)
+                
+                # Clean up old entries (keep only last 1000 files to prevent memory bloat)
+                if len(self._processed_files) > 1000:
+                    # Remove oldest 200 entries
+                    sorted_files = sorted(self._processed_files.items(), key=lambda x: x[1][1])
+                    for old_file, _ in sorted_files[:200]:
+                        del self._processed_files[old_file]
+                
+                return True
+                
+        except (OSError, PermissionError) as e:
+            logging.error(f"Error checking file {file_path}: {e}")
+            return False
+
+    def _trigger_folder_processing(self, folder_path):
+        """Trigger processing of a folder by updating its modification time"""
+        try:
+            # Verify folder exists before attempting to touch it
+            if not os.path.exists(folder_path):
+                logging.warning(f"Folder does not exist, skipping processing: {folder_path}")
+                return
+            
+            if not os.path.isdir(folder_path):
+                logging.warning(f"Path is not a directory, skipping processing: {folder_path}")
+                return
+            
+            # Touch the folder to trigger watchdog event
+            current_time = time.time()
+            os.utime(folder_path, (current_time, current_time))
+            logging.info(f"Triggered processing of folder with new files: {folder_path}")
+        except PermissionError as e:
+            logging.error(f"Permission denied when triggering processing of folder {folder_path}: {e}")
+        except OSError as e:
+            logging.error(f"OS error when triggering processing of folder {folder_path}: {e}")
+        except Exception as e:
+            logging.error(f"Unexpected error triggering processing of folder {folder_path}: {e}")
+            logging.error(f"Continuing with file checker despite folder error...")
+
 
     def _do_config_save(self):
         """Actually save the config file"""
